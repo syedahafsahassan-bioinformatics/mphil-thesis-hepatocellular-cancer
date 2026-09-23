@@ -1,0 +1,804 @@
+# Install BiocManager
+install.packages("BiocManager")
+
+# Bioconductor packages (genomics tools)
+BiocManager::install(c(
+  "WGCNA", "impute", "preprocessCore",
+  "GO.db", "AnnotationDbi", "clusterProfiler",
+  "org.Hs.eg.db", "enrichplot"
+), ask = FALSE)
+
+# CRAN packages (visualization & ML)
+install.packages(c(
+  "ggplot2", "dplyr", "tidyr", "pheatmap",
+  "corrplot", "RColorBrewer", "ggrepel",
+  "reshape2", "gridExtra", "glmnet",
+  "randomForest", "caret", "pROC",
+  "dynamicTreeCut", "flashClust"
+))
+# Direct download of TCGA-LIHC HiSeqV2 expression matrix
+url <- https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.LIHC.sampleMap%2FHiSeqV2.gz 
+#Gives R the online address of the TCGA-LIHC gene expression data.
+download.file(url, destfile = "HiSeqV2.gz", mode = "wb")
+#Downloads the data to your computer and saves it as HiSeqV2.gz.
+# Load into R as expression matrix
+expr_data <- read.table(gzfile("HiSeqV2.gz"),
+  header = TRUE, sep = "\t", row.names = 1)
+
+# Verify dimensions
+dim(expr_data)   # should be 20530 genes × 423 samples
+library(WGCNA)
+
+# Transpose: WGCNA needs samples as rows, genes as columns
+expr_t <- t(expr_data)
+
+# Hierarchical clustering to detect outliers
+sampleTree <- hclust(dist(expr_t), method = "average")
+
+# Remove outliers above cut height
+cutHeight <- 310
+clust <- cutreeStatic(sampleTree, cutHeight = cutHeight, minSize = 10)
+keepSamples <- (clust == 1)
+expr_clean <- expr_t[keepSamples, ]
+cat("Samples remaining:", nrow(expr_clean))  # → 418
+# Keep genes expressed in ≥50% of samples
+keep_genes <- rowSums(expr_data > 0) >= (0.5 * ncol(expr_data))
+expr_filtered <- expr_data[keep_genes, ]
+
+# Transpose for WGCNA and remove NAs
+expr_clean <- t(na.omit(expr_filtered))
+cat("Genes retained:", ncol(expr_clean))  # → 16,909
+
+# Extract sample names from cleaned expression matrix
+expr_samples <- rownames(expr_clean)
+
+# Encode tumor status from TCGA sample code (01 = Tumor, 11 = Normal)
+sample_types <- substr(expr_samples, 14, 15)
+#Takes characters 14–15 from each TCGA sample ID.
+traitData <- data.frame(
+  Normal = as.numeric(sample_types == "11"),
+  Tumor  = as.numeric(sample_types == "01"),
+  row.names = expr_samples
+)
+
+
+# Optionally add tumor stage and vital status if available
+traitData$TumorStage  <- as.numeric(gsub("Stage |[ABCDabcd]", "", clinical_matched$pathologic_stage))
+traitData$VitalStatus <- as.numeric(clinical_matched$vital_status == "Dead")
+
+# Verify
+cat("Trait matrix:", dim(traitData))  
+
+allowWGCNAThreads()
+
+# Test range of powers
+powers <- c(1:10, seq(12, 20, 2))
+sft <- pickSoftThreshold(
+  expr_clean,
+  powerVector = powers,   
+  verbose = 5,
+  networkType = "unsigned"
+)
+# Plot scale-free topology fit (choose power where R² ≥ 0.80)
+plot(sft$fitIndices[,1],
+     -sign(sft$fitIndices[,3]) * sft$fitIndices[,2],
+     xlab = "Soft Threshold (power)",
+     ylab = "Scale Free Topology Model Fit (R²)",
+     type = "n")
+text(sft$fitIndices[,1],
+     -sign(sft$fitIndices[,3]) * sft$fitIndices[,2],
+     labels = powers, col = "red")
+abline(h = 0.80, col = "red")
+# Set chosen soft power
+softPower <- 5   # adjust based on plot
+# Force WGCNA to use its own cor() function
+cor <- WGCNA::cor
+
+net <- blockwiseModules(
+  expr_clean,
+  power             = softPower,
+  networkType       = "unsigned",
+  TOMType           = "unsigned",
+  minModuleSize     = 30,
+  mergeCutHeight    = 0.25,
+  numericLabels     = TRUE,
+  pamRespectsDendro = FALSE,
+  saveTOMs          = FALSE,
+  corType           = "pearson",
+  nThreads          = 1,
+  verbose           = 3
+)
+# Restore original cor()
+cor <- stats::cor
+
+# Convert to color labels
+mergedColors <- labels2colors(net$colors)
+table(mergedColors)
+
+# Save progress immediately
+save(net, expr_clean, traitData, mergedColors,
+     file = "LIHC_WGCNA_network.RData")
+# Fig1B: Gene dendrogram with module colors
+plotDendroAndColors(
+  net$dendrograms[[1]],
+  mergedColors[net$blockGenes[[1]]], 
+  "Module Colors",
+  dendroLabels = FALSE, hang = 0.03,
+  addGuide = TRUE, guideHang = 0.05,
+  main = "Gene Dendrogram and Module Colors"
+)
+# Network heatmap (memory-efficient — 400 genes only)
+expr_genes   <- colnames(expr_clean)
+network_genes <- names(net$colors)
+common_genes  <- intersect(expr_genes, network_genes)
+mergedColors  <- labels2colors(net$colors[common_genes])   
+# Select 400 non-grey genes
+set.seed(42)
+assigned_idx <- which(mergedColors != "grey")
+select_idx   <- sample(assigned_idx, min(400, length(assigned_idx)))
+select_colors <- mergedColors[select_idx]
+expr_select   <- expr_clean[, common_genes][, select_idx]
+# Compute adjacency + TOM for subset only
+adj_select  <- adjacency(expr_select, power = softPower, type = "unsigned")
+TOM_select  <- TOMsimilarity(adj_select)
+dissTOM     <- 1 - TOM_select
+gene_tree   <- hclust(as.dist(dissTOM), method = "average")
+TOMplot(dissim = dissTOM, dendro = gene_tree,
+        Colors = select_colors,
+        main   = "Network heatmap — selected genes")
+rm(adj_select, TOM_select, dissTOM); gc()
+# Calculate module eigengenes (exclude grey)
+MEs0 <- moduleEigengenes(expr_clean, mergedColors)$eigengenes
+MEs  <- orderMEs(MEs0)
+MEs  <- MEs[, !grepl("grey", colnames(MEs))]
+# Trait matrix: Normal vs Tumor columns
+sample_types   <- substr(rownames(expr_clean), 14, 15)
+traitData_new  <- data.frame(
+  Normal = as.numeric(sample_types == "11"),
+  Tumor  = as.numeric(sample_types == "01"),
+  row.names = rownames(expr_clean)
+)
+
+# Pearson correlation between modules and traits
+moduleTraitCor  <- cor(MEs, traitData_new, use = "p")
+moduleTraitPval <- corPvalueStudent(moduleTraitCor, nrow(expr_clean))
+# Build text matrix showing r and p-value
+textMatrix <- matrix(
+  paste0(signif(moduleTraitCor, 2), "\n(", signif(moduleTraitPval, 1), ")"),
+  nrow = nrow(moduleTraitCor)
+)
+# Plot module-trait heatmap
+labeledHeatmap(
+  Matrix     = moduleTraitCor,
+  xLabels    = c("Normal", "Tumor"),
+  yLabels    = gsub("ME", "", names(MEs)),
+  ySymbols   = gsub("ME", "", names(MEs)),
+  colorLabels = FALSE,
+  colors     = colorRampPalette(c("navy", "white", "firebrick3"))(75),
+  textMatrix = textMatrix,
+  setStdMargins = FALSE,
+  cex.text   = 0.5,
+  zlim       = c(-1, 1),
+  main       = "Module-Trait Relationships (HCC — TCGA LIHC)"
+)
+# Identify significant modules (|r| > 0.3, p < 0.05)
+sig_mask    <- abs(moduleTraitCor[, "Tumor"]) > 0.3 & moduleTraitPval[, "Tumor"] < 0.05
+sig_modules <- names(MEs)[sig_mask]
+cat("Significant modules:", length(sig_modules))
+# Calculate Gene Significance for tumor trait
+geneTraitSignificance <- as.data.frame(
+  cor(expr_clean, traitData_new[, "Tumor", drop=FALSE], use = "p")
+)
+colnames(geneTraitSignificance) <- "GS.Tumor"
+# Calculate Module Membership for all modules
+geneModuleMembership <- as.data.frame(cor(expr_clean, MEs, use = "p"))
+# Plot MM vs GS for each significant module
+sig_module_colors <- gsub("ME", "", sig_modules)
+sig_module_colors <- sig_module_colors[sig_module_colors != "grey"]
+pdf("Fig1E_MM_vs_GS.pdf", width = 6 * length(sig_module_colors), height = 6)
+par(mfrow = c(1, length(sig_module_colors)))
+for (mod_color in sig_module_colors) {
+  MM_col    <- paste0("ME", mod_color)
+  mod_genes <- mergedColors == mod_color
+  MM_vals   <- as.numeric(geneModuleMembership[mod_genes, MM_col])
+  GS_vals   <- as.numeric(geneTraitSignificance[mod_genes, "GS.Tumor"])
+  valid     <- complete.cases(MM_vals, GS_vals)
+  MM_vals   <- MM_vals[valid]; GS_vals <- GS_vals[valid]
+  if (length(MM_vals) < 3) next
+  cor_val   <- cor(MM_vals, GS_vals)
+  p_val     <- cor.test(MM_vals, GS_vals)$p.value
+  plot(MM_vals, GS_vals,
+    xlab = paste0("Module Membership (", mod_color, ")"),
+    ylab = "Gene Significance (Tumor)",
+    main = paste0(mod_color, "\ncor=", round(cor_val,2), ", p=", signif(p_val,2)),
+    pch = 21, col = "grey60", bg = mod_color)
+  abline(lm(GS_vals ~ MM_vals), col = "red")
+}
+dev.off()
+# Map color labels to gene names
+mergedColors       <- as.character(mergedColors)
+names(mergedColors) <- colnames(expr_clean)
+# Remove grey from significant modules
+sig_module_colors <- gsub("^ME", "", sig_modules)
+sig_module_colors <- sig_module_colors[sig_module_colors != "grey"]
+# Extract genes per module
+module_genes_list <- list()
+for (mod in sig_module_colors) {
+  genes <- names(mergedColors)[mergedColors == mod]
+  module_genes_list[[mod]] <- genes
+  cat("Module", mod, ":", length(genes), "genes\n")
+}
+
+# Combine into single unique gene list
+coexpressed_genes <- unique(unlist(module_genes_list))
+cat("Total co-expressed genes:", length(coexpressed_genes))
+
+# Save
+write.csv(data.frame(Gene = coexpressed_genes),
+          "HCC_coexpressed_genes.csv", row.names = FALSE)
+library(clusterProfiler); library(org.Hs.eg.db)
+library(igraph); library(ggplot2); library(ggforce)
+
+# Convert gene symbols to Entrez IDs
+gene_ids <- bitr(coexpressed_genes,
+  fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+# GO Biological Process enrichment
+go_bp <- enrichGO(gene = gene_ids$ENTREZID, OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID", ont = "BP",
+  pAdjustMethod = "BH", qvalueCutoff = 0.05)
+# Compute pairwise term similarity
+go_bp_sim <- pairwise_termsim(go_bp)
+# Build network from top 30 terms
+top_terms  <- go_bp@result$Description[1:30]
+sim_sub    <- go_bp_sim@termsim[top_terms, top_terms]
+sim_sub[is.na(sim_sub)] <- 0; sim_sub[sim_sub < 0.02] <- 0
+g <- graph_from_adjacency_matrix(sim_sub, mode="undirected", weighted=TRUE, diag=FALSE)
+# Fruchterman-Reingold layout
+set.seed(42)
+layout_coords <- layout_with_fr(g)
+coords <- as.data.frame(layout_coords)
+colnames(coords) <- c("x","y"); coords$name <- V(g)$name
+# Node data (size = gene count, color = p.adjust)
+node_df <- data.frame(name=V(g)$name, x=coords$x, y=coords$y)
+node_df$p.adjust <- go_bp@result$p.adjust[match(node_df$name, go_bp@result$Description)]
+node_df$size     <- go_bp@result$Count[match(node_df$name, go_bp@result$Description)]
+# Louvain clustering for node grouping
+clusters <- cluster_louvain(g)
+node_df$cluster <- as.factor(membership(clusters))
+# Edge coordinates
+edge_list   <- as.data.frame(as_edgelist(g))
+colnames(edge_list) <- c("from","to")
+edge_coords <- merge(merge(edge_list, coords, by.x="from", by.y="name"),
+                     coords, by.x="to", by.y="name", suffixes=c("_from","_to"))
+# Cluster label = most significant term per cluster
+cluster_labels <- node_df %>% group_by(cluster) %>%
+  slice_min(order_by=p.adjust, n=1) %>%
+  summarise(label=first(name), x=mean(x), y=mean(y), .groups="drop")
+
+# Plot
+p_bp <- ggplot() +
+  geom_segment(data=edge_coords,
+    aes(x=x_from, y=y_from, xend=x_to, yend=y_to),
+    color="grey50", linewidth=0.3, alpha=0.7) +
+  geom_point(data=node_df,
+    aes(x=x, y=y, size=size, color=p.adjust), alpha=0.9) +
+  geom_text(data=cluster_labels,
+    aes(x=x+0.4, y=y+0.4, label=stringr::str_wrap(label,25)),
+    size=3, fontface="bold", color="black", hjust=0) +
+  scale_color_gradient(name="p.adjust", low="#D73027", high="#4575B4", trans="reverse") +
+  scale_size_continuous(name="pathway size", range=c(2,8)) +
+  ggtitle("GO Biological Process Enrichment Network") +
+  theme_void()
+
+ggsave("Fig2A_GO_BP_network.pdf", plot=p_bp, width=12, height=10, dpi=300)
+
+# Repeat same steps for CC (go_cc) and MF (go_mf) — save as Fig2B and Fig2C
+############################9B · Reactome GSEA (Fig2D)#######################################
+library(ReactomePA)
+
+# Convert co-expressed genes to Entrez IDs for ranking
+coexpr_entrez <- bitr(coexpressed_genes,
+  fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+# Create ranked gene list (use absolute values, sorted decreasing)
+ranked_subset <- sort(abs(ranked_final[names(ranked_final) %in% coexpr_entrez$ENTREZID]),
+                      decreasing = TRUE)
+
+# Run GSEA on Reactome pathways
+set.seed(42)
+gsea_reactome <- gsePathway(
+  geneList    = ranked_subset,
+  organism    = "human",
+  minGSSize   = 5,
+  maxGSSize   = 500,
+  pvalueCutoff = 0.05,
+  verbose     = TRUE
+)
+cat("Pathways found:", nrow(gsea_reactome))  # → 69
+
+# Select top 3 pathways by adjusted p-value
+top_pathways <- gsea_reactome@result %>% arrange(p.adjust) %>% slice(1:3) %>% pull(ID)
+
+# Plot GSEA enrichment plot
+p_reactome <- gseaplot2(
+  gsea_reactome, geneSetID = top_pathways,
+  title = "", color = c("red", "green", "blue"),
+  base_size = 11, rel_heights = c(1.5, 0.5, 1), pvalue_table = FALSE
+)
+ggsave("Fig2D_Reactome_GSEA.pdf", plot=p_reactome, width=10, height=7, dpi=300)
+####################################PART 4 — MACHINE LEARNING  ###################################
+library(glmnet); library(randomForest); library(caret); library(pROC)
+
+# Subset to co-expressed genes only
+common_genes <- intersect(coexpressed_genes, colnames(expr_clean))
+expr_ml <- expr_clean[, common_genes]
+
+# Encode outcome
+sample_types <- substr(rownames(expr_clean), 14, 15)
+outcome      <- factor(ifelse(sample_types == "01", "Tumor", "Normal"),
+                       levels = c("Normal", "Tumor"))
+
+# Train/test split (70/30)
+set.seed(42)
+train_idx <- createDataPartition(outcome, p = 0.7, list = FALSE)
+X_train <- expr_ml[train_idx, ]; y_train <- outcome[train_idx]
+X_test  <- expr_ml[-train_idx, ]; y_test  <- outcome[-train_idx]
+
+# Convert to matrix + numeric for glmnet
+X_train_mat <- as.matrix(X_train)
+X_test_mat  <- as.matrix(X_test)
+y_train_num <- as.numeric(y_train) - 1
+y_test_num  <- as.numeric(y_test)  - 1
+#####################################11 · LASSO — Strict Gene Selection via L1 Penalty#################
+set.seed(42)
+
+# Run LASSO with 10-fold cross-validation
+lasso_cv <- cv.glmnet(
+  x = X_train_mat, y = y_train_num,
+  alpha = 1, nfolds = 10,
+  family = "binomial", type.measure = "auc"
+)
+
+cat("Best lambda:", lasso_cv$lambda.min)  # → 0.0172
+
+# Extract non-zero gene coefficients
+lasso_coef  <- coef(lasso_cv, s = "lambda.min")
+lasso_genes <- rownames(lasso_coef)[which(lasso_coef != 0)]
+lasso_genes <- lasso_genes[lasso_genes != "(Intercept)"]
+cat("Lasso genes selected:", length(lasso_genes))  # → 17
+
+# Plot LASSO — CV curve + coefficient paths
+pdf("Fig3A_Lasso.pdf", width = 8, height = 6)
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 1))
+plot(lasso_cv, xlab = "Log(λ)", ylab = "Binomial Deviance", col = "red", main = "")
+plot(lasso_cv$glmnet.fit, xvar = "lambda", label = FALSE,
+     xlab = "Log Lambda", ylab = "Coefficients", main = "")
+abline(v = -log(lasso_cv$lambda.min), col = "red", lty = 2, lwd = 2)
+dev.off()
+
+save(lasso_cv, lasso_genes, file = "HCC_Lasso_results.RData")
+##################################12 · Elastic Net — Combined L1 + L2 Penalty##############################
+set.seed(42)
+
+# Run Elastic Net (alpha=0.5 = 50% LASSO + 50% Ridge)
+enet_cv <- cv.glmnet(
+  x = X_train_mat, y = y_train_num,
+  alpha = 0.5, nfolds = 10,
+  family = "binomial", type.measure = "auc"
+)
+
+cat("Elastic Net lambda.min:", enet_cv$lambda.min)  # → 0.0078
+
+# Extract non-zero gene coefficients
+enet_coef  <- coef(enet_cv, s = "lambda.min")
+enet_genes <- rownames(enet_coef)[which(enet_coef != 0)]
+enet_genes <- enet_genes[enet_genes != "(Intercept)"]
+cat("Elastic Net genes:", length(enet_genes))  # → 81
+
+# Plot coefficient values as dot plot
+enet_coef_df <- data.frame(
+  Gene        = enet_genes,
+  Coefficient = as.numeric(enet_coef[enet_genes, 1])
+)
+enet_coef_df <- enet_coef_df[order(enet_coef_df$Coefficient), ]
+enet_coef_df$Gene <- factor(enet_coef_df$Gene, levels = enet_coef_df$Gene)
+
+p_enet <- ggplot(enet_coef_df, aes(x = Coefficient, y = Gene)) +
+  geom_point(aes(color = Coefficient), size = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_gradient2(low="#4575B4", mid="grey80", high="#D73027", midpoint=0) +
+  labs(title = "Elastic Net — Influential Variables", x = "Coefficient", y = "") +
+  theme_bw() + theme(axis.text.y = element_text(size = 6))
+
+ggsave("Fig3B_ElasticNet_genes.pdf", plot = p_enet, width = 8, height = 6, dpi = 300)
+save(enet_cv, enet_genes, enet_coef_df, file = "HCC_ElasticNet_results.RData")
+#################################13 · Random Forest — Ensemble Tree Feature Importance##################
+set.seed(42)
+
+# Train Random Forest (500 trees)
+rf_model <- randomForest(
+  x         = X_train_mat,
+  y         = y_train,
+  ntree     = 500,
+  importance = TRUE,
+  mtry      = floor(sqrt(ncol(X_train_mat))),
+  verbose   = TRUE
+)
+
+# Check OOB error rate (~2% = excellent)
+cat("OOB error rate:", rf_model$err.rate[nrow(rf_model$err.rate), 1])
+
+# Extract top 20 genes by Mean Decrease Accuracy
+rf_importance <- importance(rf_model, type = 1)
+rf_imp_df     <- data.frame(Gene = rownames(rf_importance),
+                             Importance = rf_importance[, 1])
+rf_imp_df     <- rf_imp_df[order(rf_imp_df$Importance, decreasing = TRUE), ]
+rf_genes      <- rf_imp_df$Gene[1:20]
+
+# Plot lollipop chart of top 20 genes
+top20_df <- rf_imp_df[1:20, ]
+top20_df$Gene <- factor(top20_df$Gene, levels = rev(top20_df$Gene))
+
+p_rf <- ggplot(top20_df, aes(x = Importance, y = Gene)) +
+  geom_segment(aes(x=0, xend=Importance, y=Gene, yend=Gene), linewidth=0.4) +
+  geom_point(color = "#2E86C1", size = 2) +
+  labs(title = "Random Forest Feature Importance", x = "Importance", y = "") +
+  theme_bw() + theme(panel.grid = element_blank())
+
+ggsave("Fig3C_RandomForest_genes.pdf", plot = p_rf, width = 5, height = 7, dpi = 300)
+save(rf_model, rf_genes, rf_imp_df, file = "HCC_RandomForest_results.RData")
+###############################confusion matrix and ROC validation##############################
+library(viridis)
+
+# Get predicted probabilities from each model on test set
+lasso_pred_prob <- predict(lasso_cv, newx=X_test_mat, s="lambda.min", type="response")[,1]
+enet_pred_prob  <- predict(enet_cv,  newx=X_test_mat, s="lambda.min", type="response")[,1]
+rf_pred_prob    <- predict(rf_model, newdata=X_test_mat, type="prob")[, "Tumor"]
+
+# Function to plot normalized confusion matrix
+plot_cm <- function(pred_prob, true_labels, title, filename) {
+  pred_class  <- factor(ifelse(pred_prob > 0.5, "Tumor", "Normal"), levels=c("Tumor","Normal"))
+  true_class  <- factor(ifelse(true_labels == 1, "Tumor", "Normal"), levels=c("Tumor","Normal"))
+  cm          <- confusionMatrix(pred_class, true_class)
+  cm_norm     <- cm$table / rowSums(cm$table)
+  cm_df       <- as.data.frame(cm_norm)
+  colnames(cm_df) <- c("Predicted", "Actual", "Proportion")
+  p <- ggplot(cm_df, aes(x=Predicted, y=Actual, fill=Proportion)) +
+    geom_tile(color="white", linewidth=2) +
+    geom_text(aes(label=sprintf("%.2f", Proportion)), size=12, fontface="bold", color="white") +
+    scale_fill_viridis(option="viridis", limits=c(0,1)) +
+    labs(title="Normalized confusion matrix", x="Predicted", y="True label") +
+    theme_bw()
+  ggsave(filename, plot=p, width=6, height=5, dpi=300)
+  return(p)
+}
+
+p_cm_lasso <- plot_cm(lasso_pred_prob, y_test_num, "Lasso",       "Fig4A_Lasso_CM.pdf")
+p_cm_enet  <- plot_cm(enet_pred_prob,  y_test_num, "Elastic Net", "Fig4B_ElasticNet_CM.pdf")
+p_cm_rf    <- plot_cm(rf_pred_prob,    y_test_num, "Random Forest","Fig4C_RF_CM.pdf")
+
+ggsave("Fig4_All_ConfusionMatrices.pdf",
+       plot = grid.arrange(p_cm_lasso, p_cm_enet, p_cm_rf, ncol=3),
+       width=15, height=5, dpi=300)
+
+###############################Validation ROC Curves on GSE77509################################
+library(GEOquery); library(limma)
+
+# Download independent validation dataset
+gse77509 <- getGEO("GSE77509", GSEMatrix = TRUE, getGPL = FALSE)[[1]]
+
+# Define groups from metadata
+outcome_77509 <- factor(ifelse(
+  grepl("tumor|HCC|hepatocellular", pData(gse77509)$source_name_ch1, ignore.case=TRUE),
+  "Tumor", "Normal"), levels=c("Normal","Tumor"))
+
+# Extract and clean expression matrix
+expr_77509  <- exprs(gse77509)
+feat_77509  <- fData(gse77509)
+gene_col    <- colnames(feat_77509)[grep("symbol", colnames(feat_77509), ignore.case=TRUE)[1]]
+gene_syms   <- feat_77509[[gene_col]]
+valid       <- !is.na(gene_syms) & gene_syms != ""
+
+# Average duplicates, normalize, log2 transform
+expr_df  <- as.data.frame(expr_77509[valid, ])
+expr_df$Gene <- gene_syms[valid]
+expr_agg <- expr_df %>% group_by(Gene) %>% summarise(across(everything(), mean))
+expr_mat <- as.matrix(expr_agg[, -1]); rownames(expr_mat) <- expr_agg$Gene
+expr_norm <- normalizeBetweenArrays(log2(expr_mat + 1), method = "quantile")
+
+# Align to training feature space
+feature_genes  <- colnames(X_train_mat)
+common         <- intersect(rownames(expr_norm), feature_genes)
+val_mat        <- t(expr_norm[common, ])
+missing        <- setdiff(feature_genes, common)
+if (length(missing) > 0)
+  val_mat <- cbind(val_mat, matrix(0, nrow=nrow(val_mat), ncol=length(missing),
+                   dimnames=list(rownames(val_mat), missing)))
+val_mat <- val_mat[, feature_genes, drop=FALSE]
+y_val   <- as.numeric(outcome_77509 == "Tumor")
+
+# Predict and compute ROC
+roc_lasso_val <- roc(y_val, predict(lasso_cv, newx=val_mat, s="lambda.min", type="response")[,1])
+roc_enet_val  <- roc(y_val, predict(enet_cv,  newx=val_mat, s="lambda.min", type="response")[,1])
+roc_rf_val    <- roc(y_val, predict(rf_model, newdata=val_mat, type="prob")[,"Tumor"])
+
+cat("LASSO AUC:", round(auc(roc_lasso_val), 4))
+cat("Elastic Net AUC:", round(auc(roc_enet_val), 4))
+cat("Random Forest AUC:", round(auc(roc_rf_val), 4))
+
+# Plot ROC curves and save
+ggsave("Fig4_Validation_ROC.pdf",
+  plot = grid.arrange(
+    plot_single_roc(roc_lasso_val, "ROC of Lasso",       paste0("AUC=", round(auc(roc_lasso_val),3))),
+    plot_single_roc(roc_enet_val,  "ROC of ElasticNet",  paste0("AUC=", round(auc(roc_enet_val),3))),
+    plot_single_roc(roc_rf_val,    "ROC of RandomForest",paste0("AUC=", round(auc(roc_rf_val),3))),
+    ncol=3), width=12, height=4, dpi=300)
+################################################━━━  PART 5 — scRNA-SEQ ANALYSIS  ######################
+library(Seurat)
+
+# Extract raw data
+untar("GSE299340_RAW.tar", exdir = "GSE299340/raw")
+
+# Define sample metadata
+sample_meta <- data.frame(
+  gsm    = c("GSM9037556","GSM9037557","GSM9037558","GSM9037559","GSM9037560",
+             "GSM9037561","GSM9037562","GSM9037563","GSM9037564","GSM9037565"),
+  sample = as.character(291:300),
+  group  = c("Tumor","Tumor","Tumor","Tumor","Tumor",
+             "Normal","Normal","Normal","Normal","Normal")
+)
+
+# Load each sample into a Seurat object
+raw_dir <- "GSE299340/raw"
+seurat_list <- lapply(seq_len(nrow(sample_meta)), function(i) {
+  sid <- sample_meta$sample[i]
+  grp <- sample_meta$group[i]
+  gsm <- sample_meta$gsm[i]
+  mat <- ReadMtx(
+    mtx      = file.path(raw_dir, paste0(gsm,"_",sid,"_matrix.mtx.gz")),
+    cells    = file.path(raw_dir, paste0(gsm,"_",sid,"_barcodes.tsv.gz")),
+    features = file.path(raw_dir, paste0(gsm,"_",sid,"_features.tsv.gz"))
+  )
+  obj <- CreateSeuratObject(counts=mat, project=sid, min.cells=3, min.features=200)
+  obj$sample <- sid; obj$group <- grp; obj$gsm <- gsm
+  obj
+})
+names(seurat_list) <- sample_meta$sample
+cat("All", length(seurat_list), "samples loaded")
+######################################16 · Calculate MT% and Filter Low-Quality Cells#########################
+# Calculate mitochondrial percentage per cell
+seurat_list <- lapply(seurat_list, function(obj) {
+  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+  obj
+})
+
+# Merge for QC visualization
+qc_merged <- merge(seurat_list[[1]], y = seurat_list[-1],
+                   add.cell.ids = sample_meta$sample)
+
+# QC violin plot BEFORE filtering
+p_qc_before <- VlnPlot(qc_merged,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+  group.by = "sample", ncol = 3, pt.size = 0)
+ggsave("QC_violin_before_filter.pdf", plot=p_qc_before, width=14, height=5, dpi=300)
+
+# Apply QC filters
+seurat_list <- lapply(seurat_list, function(obj) {
+  subset(obj, subset = nFeature_RNA > 200 &
+                       nFeature_RNA < 6000 &
+                       percent.mt < 20)
+})
+
+# Count retained cells
+total_after <- sum(sapply(seurat_list, ncol))
+cat("Total cells after QC:", total_after)  # → 70,608
+###################17 · Merge, Normalize, Select Variable Genes, PCA + Harmony###########################
+library(harmony)
+
+# Normalize each sample
+seurat_list <- lapply(seurat_list, function(obj) {
+  obj <- NormalizeData(obj)
+  obj <- FindVariableFeatures(obj, nfeatures = 2000)
+  obj
+})
+
+# Merge all 10 samples
+combined <- merge(seurat_list[[1]], y = seurat_list[-1],
+                  add.cell.ids = sample_meta$sample)
+
+# Scale and PCA
+combined <- ScaleData(combined)
+combined <- RunPCA(combined, npcs = 30)
+
+# Harmony batch correction (removes per-sample variation)
+combined <- RunHarmony(combined, group.by.vars = "sample", max.iter.harmony = 20)
+
+# Save checkpoint
+saveRDS(combined, "GSE299340_merged_harmony.rds")
+cat("Harmony done! Reductions:", names(combined@reductions))
+
+####################18 · FindNeighbors, FindClusters, tSNE####################
+# Graph-based clustering using Harmony reduction
+combined <- FindNeighbors(combined, dims = 1:20, reduction = "harmony")
+combined <- FindClusters(combined, resolution = 0.3)
+cat("Clusters:", length(unique(combined$seurat_clusters)))  # → 15
+
+# tSNE visualization
+combined <- RunTSNE(combined, dims = 1:20, reduction = "harmony",
+                    check_duplicates = FALSE)
+
+# Fig6C: tSNE colored by cluster
+p_clusters <- DimPlot(combined, reduction="tsne", group.by="seurat_clusters",
+                      label=TRUE, repel=TRUE, pt.size=0.3, label.size=4) +
+  labs(x="tSNE_1", y="tSNE_2") + theme_classic()
+ggsave("Fig6C_tSNE_Clusters.pdf", plot=p_clusters, width=8, height=7, dpi=300)
+
+# Fig6A: tSNE colored by sample
+p_sample <- DimPlot(combined, reduction="tsne", group.by="sample", pt.size=0.3)
+ggsave("Fig6A_tSNE_Sample.pdf", plot=p_sample, width=8, height=7, dpi=300)
+
+# Save
+saveRDS(combined, "GSE299340_clustered.rds")
+#####################19A · FindAllMarkers — Wilcoxon Rank-Sum Test##################################
+# Downsample and join layers for RAM efficiency
+combined_small <- subset(combined, downsample = 200)
+DefaultAssay(combined_small) <- "RNA"
+combined_small[["RNA"]] <- JoinLayers(combined_small[["RNA"]])
+
+# Find marker genes per cluster
+markers <- FindAllMarkers(
+  combined_small,
+  only.pos        = TRUE,
+  min.pct         = 0.25,
+  logfc.threshold = 0.25,
+  test.use        = "wilcox"
+)
+cat("Markers found:", nrow(markers))  # → 26,236
+write.csv(markers, "GSE299340_markers.csv", row.names = FALSE)
+
+# Fig6B: Top 3 marker genes per cluster heatmap
+top3 <- markers %>% group_by(cluster) %>% slice_max(avg_log2FC, n=3) %>% ungroup()
+combined_down <- subset(combined, downsample = 50)
+combined_down <- ScaleData(combined_down, features = unique(top3$gene))
+
+p_heat <- DoHeatmap(combined_down, features=unique(top3$gene),
+  group.by="seurat_clusters", raster=TRUE, size=5) +
+  scale_fill_gradientn(colors=c("#3B0F70","black","#FDE725"), limits=c(-2.5,2.5))
+ggsave("Fig6B_Heatmap.pdf", plot=p_heat, width=12, height=8, dpi=300)
+rm(combined_down, combined_small); gc()
+#####################19B · SingleR Automated Cell Type Annotation#######################
+library(SingleR); library(celldex)
+
+# Run SingleR on 5000-cell subset (RAM efficient)
+combined_sub <- subset(combined, downsample = 500)
+combined_sub <- JoinLayers(combined_sub)
+expr_sub     <- GetAssayData(combined_sub, assay="RNA", layer="data")
+
+ref      <- HumanPrimaryCellAtlasData()
+anno_sub <- SingleR(test=expr_sub, ref=ref, labels=ref$label.main)
+cat("Annotation done!\n")
+print(table(anno_sub$labels))
+
+# Transfer to full object by cluster majority vote
+combined_sub$cell_type <- anno_sub$labels
+cluster_anno <- data.frame(
+  cluster   = combined_sub$seurat_clusters,
+  cell_type = combined_sub$cell_type) %>%
+  group_by(cluster) %>%
+  summarise(cell_type = names(which.max(table(cell_type))), .groups="drop")
+
+# Assign to full object using case_when
+cluster_vec <- as.character(combined$seurat_clusters)
+combined@meta.data$cell_type <- dplyr::case_when(
+  cluster_vec == "0"  ~ "T_cells",
+  cluster_vec == "1"  ~ "T_cells",
+  cluster_vec == "2"  ~ "Macrophage",
+  cluster_vec == "3"  ~ "Hepatocytes",
+  cluster_vec == "4"  ~ "Monocyte",
+  cluster_vec == "5"  ~ "NK_cell",
+  cluster_vec == "6"  ~ "Neutrophils",
+  cluster_vec == "7"  ~ "Endothelial_cells",
+  cluster_vec == "8"  ~ "B_cell",
+  cluster_vec == "9"  ~ "Hepatocytes",
+  cluster_vec == "10" ~ "B_cell",
+  cluster_vec == "11" ~ "Macrophage",
+  cluster_vec == "12" ~ "T_cells",
+  cluster_vec == "13" ~ "Tissue_stem_cells",
+  cluster_vec == "14" ~ "B_cell"
+)
+
+# Fig6D: tSNE by cell type
+p_celltype <- DimPlot(combined, reduction="tsne", group.by="cell_type",
+                      label=TRUE, repel=TRUE, pt.size=0.3)
+ggsave("Fig6D_tSNE_CellType.pdf", plot=p_celltype, width=8, height=7, dpi=300)
+
+# Save annotated object
+saveRDS(combined, "GSE299340_merged_annotated.rds")
+rm(combined_sub, expr_sub); gc()
+
+########################20 · Compare Cell Type Proportions: Tumor vs Normal#############################
+library(ggplot2); library(dplyr)
+
+# Calculate proportions per group
+prop_df <- combined@meta.data %>%
+  group_by(group, cell_type) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(group) %>%
+  mutate(prop = n / sum(n))
+
+# Fig6E: Grouped bar chart
+p6e <- ggplot(prop_df, aes(x=cell_type, y=prop, fill=group)) +
+  geom_bar(stat="identity", position="dodge", width=0.7) +
+  scale_fill_manual(values=c("Tumor"="#E74C3C", "Normal"="#3498DB")) +
+  scale_y_continuous(limits=c(0,1), breaks=seq(0,1,0.25)) +
+  labs(title="Cell Type Distribution: Tumor vs Normal",
+       x=NULL, y="Proportion") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=45, hjust=1, size=9),
+        panel.grid  = element_blank())
+
+ggsave("Fig6E_CellProportions.pdf", plot=p6e, width=10, height=6, dpi=300)
+
+######################21 · Differential Expression Across All Clusters####################################
+# Load all DEGs (run FindAllMarkers on full annotated object)
+all_markers_deg <- read.csv("GSE299340_markers.csv")
+
+# Categorize genes
+df <- all_markers_deg %>%
+  mutate(
+    category = case_when(
+      avg_log2FC > 0.25 & p_val_adj < 0.05 ~ "UP",
+      avg_log2FC < -0.25 & p_val_adj < 0.05 ~ "DOWN",
+      TRUE ~ "NonDEG"
+    ),
+    cluster = as.factor(cluster),
+    x_center = as.numeric(cluster),
+    x = x_center + runif(n(), -0.35, 0.35)   # scatter within cluster
+  )
+
+# Labels: top 4 up + top 4 down per cluster
+labels_df <- df %>% group_by(cluster) %>%
+  slice_max(avg_log2FC, n=4) %>%
+  bind_rows(df %>% group_by(cluster) %>% slice_min(avg_log2FC, n=4)) %>%
+  ungroup()
+
+# Fig7A: Scatter plot
+p7a <- ggplot(df, aes(x=x, y=avg_log2FC)) +
+  geom_point(aes(color=category), size=0.6, alpha=0.9) +
+  geom_text_repel(data=labels_df, aes(label=gene, color=category), size=3) +
+  scale_color_manual(values=c("UP"="#E64B35","DOWN"="#4DBBD5","NonDEG"="grey70")) +
+  scale_x_continuous(breaks=unique(as.numeric(df$cluster)),
+                     labels=levels(df$cluster)) +
+  labs(x="Clusters", y="log2(Fold Change)") +
+  theme_classic()
+
+ggsave("Fig7A_DEG_scatter.pdf", p7a, width=14, height=5)
+
+# Count significant DEGs
+sig_up   <- subset(all_markers_deg, p_val_adj < 0.05 & avg_log2FC > 0.25)
+sig_down <- subset(all_markers_deg, p_val_adj < 0.05 & avg_log2FC < -0.25)
+cat("Upregulated:", nrow(sig_up), "| Downregulated:", nrow(sig_down))
+#########################22 · Intersect Strict scRNA DEGs with Bulk ML Genes###############################
+# Strict scRNA DEGs
+scrna_degs <- unique(subset(all_markers_deg,
+  p_val_adj < 0.05 & abs(avg_log2FC) > 1)$gene)
+cat("Strict scRNA DEGs:", length(scrna_degs))
+
+# ML genes found in ≥2 methods
+gene_counts <- read.csv("HCC_ML_gene_overlap.csv")
+strict_ml_genes <- gene_counts$Gene[gene_counts$Count >= 2]
+cat("Strict ML genes:", length(strict_ml_genes))  # → 101
+
+# Intersect
+hub_genes <- intersect(strict_ml_genes, scrna_degs)
+cat("\n>>> Hub genes confirmed:", length(hub_genes))
+print(hub_genes)
+
+# Save hub genes
+write.csv(data.frame(HubGene = hub_genes),
+          "HCC_hub_genes_strict.csv", row.names = FALSE)
+
+# Save all ML results
+save(lasso_cv, enet_cv, rf_model, lasso_genes, enet_genes, rf_genes,
+     hub_genes, file = "HCC_all_ML_results.RData")
+
