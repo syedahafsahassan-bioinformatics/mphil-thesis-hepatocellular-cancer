@@ -138,9 +138,10 @@ assigned_idx <- which(mergedColors != "grey")
 select_idx   <- sample(assigned_idx, min(400, length(assigned_idx)))
 select_colors <- mergedColors[select_idx]
 expr_select   <- expr_clean[, common_genes][, select_idx]
-# Compute adjacency + TOM for subset only
+# Compute adjacency that is the direct connection between the 400 genes + TOM that is the same neighbors for subset only
 adj_select  <- adjacency(expr_select, power = softPower, type = "unsigned")
 TOM_select  <- TOMsimilarity(adj_select)
+#TOM represents similarity so we convert it into dissimilarity that is important for heirarcial clustering
 dissTOM     <- 1 - TOM_select
 gene_tree   <- hclust(as.dist(dissTOM), method = "average")
 TOMplot(dissim = dissTOM, dendro = gene_tree,
