@@ -34,7 +34,57 @@ expr_t <- t(expr_data)
 
 # Hierarchical clustering to detect outliers
 sampleTree <- hclust(dist(expr_t), method = "average")
+#################Choosing the proper cutoff value#####################################
 
+library(WGCNA)
+
+# Check the candidate cutoffs
+candidate_heights <- c(200, 250, 300, 350, 400, 500)
+
+cutoff_results <- do.call(
+  rbind,
+  lapply(candidate_heights, function(h) {
+    
+    ct <- cutreeStatic(
+      sampleTree,
+      cutHeight = h,
+      minSize = 10
+    )
+    
+    tab <- table(ct)
+    
+    data.frame(
+      Cutoff = h,
+      Total_samples = length(ct),
+      Main_cluster = sum(ct == 1),
+      Flagged_or_other = sum(ct != 1),
+      Number_of_clusters = length(tab),
+      Cluster_sizes = paste(
+        names(tab), as.integer(tab),
+        sep = ":",
+        collapse = "; "
+      )
+    )
+  })
+)
+
+print(cutoff_results, row.names = FALSE)
+
+# Inspect cluster assignments at each cutoff
+for (h in candidate_heights) {
+  ct <- cutreeStatic(
+    sampleTree,
+    cutHeight = h,
+    minSize = 10
+  )
+  
+  cat("\nCutoff:", h, "\n")
+  print(table(ct))
+  
+  # Names of samples not assigned to the main cluster
+  cat("Samples outside cluster 1:\n")
+  print(rownames(expr_t)[ct != 1])
+}
 # Remove outliers above cut height
 cutHeight <- 310
 clust <- cutreeStatic(sampleTree, cutHeight = cutHeight, minSize = 10)
