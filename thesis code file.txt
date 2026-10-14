@@ -821,6 +821,320 @@ if (nrow(gsea_reactome@result) >= 1) {
   )
 }
 cat("Done.\n")
+# =============================================================================
+# 04_machine_learning.R
+# Lasso, Elastic Net, Ridge, Random Forest on the genes of your MAIN WGCNA
+# modules (Fig 3, 5), then validation on the GEO dataset GSE77509.
+#
+# Datasets used
+#   training / test : TCGA-LIHC (UCSC Xena)  -> expr_clean, 70/30 split
+#   validation      : GSE77509 (GEO)         -> saved by 01_download_data.R
+#   (GSE299340 is the single-cell dataset; it is used in scripts 06-09, not here)
+# =============================================================================
+source("D:/Bioinfo/scripts/config.R")
+library(glmnet)
+library(randomForest)
+library(caret)
+library(pROC)
+library(ggplot2)
+library(gridExtra)
+library(viridis)
+
+# ---- 0. Settings ------------------------------------------------------------
+main_modules <- c("purple", "red")      # <- your main (top) modules; edit if they change
+do_validation <- TRUE                   # validate on GSE77509 at the end
+
+# ---- 1. Load WGCNA results and pick the genes of the main modules -----------
+if (!exists("expr_clean") || !exists("mergedColors")) {
+  load(P("rds", "LIHC_WGCNA_results.RData"))        # expr_clean, mergedColors, ...
+}
+stopifnot(identical(names(mergedColors), colnames(expr_clean)))
+
+missing_mod <- setdiff(main_modules, unique(mergedColors))
+if (length(missing_mod)) stop("Module(s) not found in mergedColors: ", paste(missing_mod, collapse = ", "))
+
+for (mc in main_modules) cat("Module", mc, ":", sum(mergedColors == mc), "genes\n")
+module_genes <- names(mergedColors)[mergedColors %in% main_modules]
+cat("Genes from main modules:", length(module_genes), "\n")
+
+# ---- 2. Feature matrix and 70/30 stratified split (TCGA-LIHC) ---------------
+sample_code <- substr(rownames(expr_clean), 14, 15)
+keep_s <- sample_code %in% c("01", "11")                     # tumor vs normal only
+X_all  <- as.matrix(expr_clean[keep_s, module_genes])
+X_all  <- X_all[, apply(X_all, 2, sd) > 0]
+y_all  <- as.numeric(sample_code[keep_s] == "01")            # Tumor = 1
+cat("ML input:", nrow(X_all), "samples x", ncol(X_all), "genes\n")
+
+set.seed(SEED)
+idx <- createDataPartition(factor(y_all), p = 0.7, list = FALSE)[, 1]
+X_train_mat <- X_all[idx, ];  X_test_mat <- X_all[-idx, ]
+y_train_num <- y_all[idx];    y_test_num <- y_all[-idx]
+y_train <- factor(ifelse(y_train_num == 1, "Tumor", "Normal"), levels = c("Normal", "Tumor"))
+print(table(y_train)); print(table(y_test_num))
+
+# ---- 3. Lasso (Fig 5A) ------------------------------------------------------
+set.seed(SEED)
+lasso_cv <- cv.glmnet(X_train_mat, y_train_num, alpha = 1, nfolds = 10,
+                      family = "binomial", type.measure = "auc")
+lasso_coef  <- coef(lasso_cv, s = "lambda.min")
+lasso_genes <- setdiff(rownames(lasso_coef)[which(lasso_coef != 0)], "(Intercept)")
+cat("Lasso lambda.min:", lasso_cv$lambda.min, "| genes:", length(lasso_genes), "\n")
+
+n_feat <- length(lasso_genes)
+y_txt  <- mean(range(as.matrix(lasso_cv$glmnet.fit$beta)))
+pdf(P("figures", "Fig5A_Lasso.pdf"), width = 8, height = 6)
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 1))
+plot(lasso_cv, xlab = "Log(lambda)", ylab = "AUC", main = "")
+plot(lasso_cv$glmnet.fit, xvar = "lambda", label = FALSE,
+     xlab = "Log Lambda", ylab = "Coefficients", main = "")
+abline(v = log(lasso_cv$lambda.min), col = "red", lty = 2, lwd = 2)
+text(log(lasso_cv$lambda.min) + 0.05, y_txt,
+     labels = paste0("lambda=", round(lasso_cv$lambda.min, 4), "\nnb_feature=", n_feat),
+     cex = 0.8, adj = 0)
+dev.off()
+
+# ---- 4. Elastic Net (Fig 5B) ------------------------------------------------
+set.seed(SEED)
+enet_cv <- cv.glmnet(X_train_mat, y_train_num, alpha = 0.5, nfolds = 10,
+                     family = "binomial", type.measure = "auc")
+enet_coef  <- coef(enet_cv, s = "lambda.min")
+enet_genes <- setdiff(rownames(enet_coef)[which(enet_coef != 0)], "(Intercept)")
+cat("Elastic Net lambda.min:", enet_cv$lambda.min, "| genes:", length(enet_genes), "\n")
+
+enet_df <- data.frame(Gene = enet_genes, Coefficient = as.numeric(enet_coef[enet_genes, 1]))
+enet_df <- enet_df[order(enet_df$Coefficient), ]
+enet_df$Gene <- factor(enet_df$Gene, levels = enet_df$Gene)
+p_enet <- ggplot(enet_df, aes(Coefficient, Gene)) +
+  geom_point(aes(colour = Coefficient), size = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  scale_colour_gradient2(low = "#4575B4", mid = "grey80", high = "#D73027", midpoint = 0) +
+  labs(title = "Influential variables", x = "Coefficient", y = "") +
+  theme_bw() + theme(plot.title = element_text(face = "bold", size = 10),
+                     axis.text.y = element_text(size = 6), legend.position = "none")
+ggsave(P("figures", "Fig5B_ElasticNet.pdf"), p_enet, width = 8,
+       height = max(6, nrow(enet_df) * 0.12), dpi = 300)
+
+# ---- 5. Ridge (only for the ROC comparison in Fig 3A) -----------------------
+set.seed(SEED)
+ridge_cv <- cv.glmnet(X_train_mat, y_train_num, alpha = 0, nfolds = 10,
+                      family = "binomial", type.measure = "auc")
+
+# ---- 6. Random Forest (Fig 5C) ----------------------------------------------
+cat("Random Forest running...\n")
+set.seed(SEED)
+rf_model <- randomForest(x = X_train_mat, y = y_train, ntree = 500, importance = TRUE,
+                         mtry = floor(sqrt(ncol(X_train_mat))), do.trace = 50)
+print(rf_model)
+imp <- importance(rf_model, type = 1)
+rf_imp_df <- data.frame(Gene = rownames(imp), Importance = imp[, 1])
+rf_imp_df <- rf_imp_df[order(rf_imp_df$Importance, decreasing = TRUE), ]
+rf_genes  <- rf_imp_df$Gene[1:20]
+
+top20 <- rf_imp_df[1:20, ]; top20$Gene <- factor(top20$Gene, levels = rev(top20$Gene))
+p_rf <- ggplot(top20, aes(Importance, Gene)) +
+  geom_segment(aes(x = 0, xend = Importance, y = Gene, yend = Gene), linewidth = 0.4) +
+  geom_point(colour = "#2E86C1", size = 2) +
+  labs(title = "Random Forest Feature Importance", y = "") +
+  theme_bw() + theme(panel.grid = element_blank(),
+                     plot.title = element_text(hjust = 0.5, face = "bold"))
+ggsave(P("figures", "Fig5C_RandomForest.pdf"), p_rf, width = 5, height = 7, dpi = 300)
+
+# ---- 7. Test-set performance on TCGA hold-out (Fig 3) -----------------------
+pr <- function(m, s = "lambda.min") as.numeric(predict(m, newx = X_test_mat, s = s, type = "response"))
+lasso_pred_prob <- pr(lasso_cv); enet_pred_prob <- pr(enet_cv); ridge_pred_prob <- pr(ridge_cv)
+rf_pred_prob <- predict(rf_model, newdata = X_test_mat, type = "prob")[, "Tumor"]
+
+rocs <- list(
+  "Random Forest"    = roc(y_test_num, rf_pred_prob,    quiet = TRUE),
+  "Elastic Net"      = roc(y_test_num, enet_pred_prob,  quiet = TRUE),
+  "Lasso"            = roc(y_test_num, lasso_pred_prob, quiet = TRUE),
+  "Ridge Regression" = roc(y_test_num, ridge_pred_prob, quiet = TRUE))
+aucs <- sapply(rocs, function(r) round(as.numeric(auc(r)), 3))
+cat("TCGA test-set AUC:\n"); print(aucs)
+names(rocs) <- paste0(names(rocs), " (AUC ", aucs, ")")
+p_roc <- ggroc(rocs, legacy.axes = TRUE) + geom_abline(colour = "grey60") +
+  labs(title = "ROC (TCGA-LIHC test set)", x = "1 - Specificity", y = "Sensitivity", colour = "") +
+  theme_bw()
+ggsave(P("figures", "Fig3A_ROC_4algorithms.pdf"), p_roc, width = 7, height = 5, dpi = 300)
+
+plot_cm <- function(pred_prob, true_num, title) {
+  pred <- factor(ifelse(pred_prob > 0.5, "Tumor", "Normal"), levels = c("Tumor", "Normal"))
+  true <- factor(ifelse(true_num == 1, "Tumor", "Normal"), levels = c("Tumor", "Normal"))
+  tab  <- table(Predicted = pred, Actual = true)
+  df   <- as.data.frame(tab / rowSums(tab)); colnames(df)[3] <- "Proportion"
+  ggplot(df, aes(Predicted, Actual, fill = Proportion)) +
+    geom_tile(colour = "white", linewidth = 2) +
+    geom_text(aes(label = sprintf("%.2f", Proportion)), size = 10, fontface = "bold", colour = "white") +
+    scale_fill_viridis(limits = c(0, 1), name = "") +
+    labs(title = title, x = "Predicted label", y = "True label") +
+    theme_bw(base_size = 13) + theme(panel.grid = element_blank(),
+                                     plot.title = element_text(hjust = 0.5, face = "bold"))
+}
+cm_all <- grid.arrange(plot_cm(lasso_pred_prob, y_test_num, "Lasso"),
+                       plot_cm(enet_pred_prob,  y_test_num, "Elastic Net"),
+                       plot_cm(rf_pred_prob,    y_test_num, "Random Forest"), ncol = 3)
+ggsave(P("figures", "Fig3BCD_ConfusionMatrices.pdf"), cm_all, width = 15, height = 5, dpi = 300)
+
+# ---- 8. Feature genes and overlap -------------------------------------------
+all_feat <- c(unique(lasso_genes), unique(enet_genes), unique(rf_genes))
+gene_counts <- as.data.frame(table(all_feat), stringsAsFactors = FALSE)
+colnames(gene_counts) <- c("Gene", "Count")
+gene_counts <- gene_counts[order(-gene_counts$Count, gene_counts$Gene), ]
+write.csv(gene_counts, P("results", "HCC_ML_gene_overlap.csv"), row.names = FALSE)
+write.csv(data.frame(Gene = lasso_genes), P("results", "ML_lasso_genes.csv"), row.names = FALSE)
+write.csv(data.frame(Gene = enet_genes),  P("results", "ML_enet_genes.csv"),  row.names = FALSE)
+write.csv(data.frame(Gene = rf_genes),    P("results", "ML_rf_genes.csv"),    row.names = FALSE)
+cat("Lasso:", length(lasso_genes), "| ENet:", length(enet_genes), "| RF:", length(rf_genes),
+    "| in >=2 methods:", sum(gene_counts$Count >= 2), "| in all 3:", sum(gene_counts$Count == 3), "\n")
+
+save(lasso_cv, enet_cv, ridge_cv, rf_model, lasso_genes, enet_genes, rf_genes,
+     X_train_mat, X_test_mat, y_train, y_train_num, y_test_num, main_modules,
+     file = P("rds", "HCC_ML_results.RData"))
+
+# ---- 9. External validation on GEO dataset GSE77509 -------------------------
+if (do_validation) {
+  library(GEOquery); library(limma)
+  gse <- readRDS(P("rds", "GSE77509_eset.rds"))
+  val_expr <- exprs(gse)
+
+  if (nrow(val_expr) == 0) {
+    cat("\nGSE77509: the series matrix has NO expression values (the data are in the\n",
+        "supplementary RAW.tar files). Validation skipped. Run\n",
+        "  list.files('D:/Bioinfo/data/raw/GSE77509', recursive = TRUE)\n",
+        "and send me the file names, then I will add a loader for them.\n", sep = "")
+  } else {
+    # --- tumor / normal labels from the sample metadata (check the printout!) ---
+    pd  <- pData(gse)
+    cols <- grep("source_name|characteristics|title", colnames(pd), value = TRUE)
+    txt <- apply(pd[, cols, drop = FALSE], 1, paste, collapse = " ")
+    is_normal <- grepl("non-?tumou?r|adjacent|normal|para-?cancer|para-?tumou?r|benign|control",
+                       txt, ignore.case = TRUE)
+    is_tumor  <- !is_normal & grepl("tumou?r|HCC|cancer|carcinoma", txt, ignore.case = TRUE)
+    group <- ifelse(is_tumor, "Tumor", ifelse(is_normal, "Normal", NA))
+    print(table(group, useNA = "ifany")); print(head(txt, 4))
+    if (anyNA(group) || length(unique(group)) < 2)
+      stop("Could not label all GSE77509 samples as Tumor/Normal; check pData(gse).")
+
+    # --- probes -> gene symbols (average duplicates) ---
+    feat <- fData(gse)
+    sym_col <- grep("symbol", colnames(feat), ignore.case = TRUE, value = TRUE)[1]
+    sym <- if (is.na(sym_col)) rownames(val_expr) else as.character(feat[[sym_col]])
+    ok  <- !is.na(sym) & sym != "" & !grepl("///", sym)
+    val_mat <- limma::avereps(val_expr[ok, , drop = FALSE], ID = sym[ok])
+
+    # --- same scale as TCGA (log2), then quantile normalise ---
+    if (max(val_mat, na.rm = TRUE) > 50) val_mat <- log2(val_mat + 1)
+    val_mat <- limma::normalizeBetweenArrays(val_mat, method = "quantile")
+
+    # --- align to the model genes (missing genes set to 0) ---
+    feature_genes <- colnames(X_train_mat)
+    common <- intersect(rownames(val_mat), feature_genes)
+    cat("Model genes found in GSE77509:", length(common), "of", length(feature_genes), "\n")
+    val <- t(val_mat[common, , drop = FALSE])
+    miss <- setdiff(feature_genes, common)
+    if (length(miss)) val <- cbind(val, matrix(0, nrow(val), length(miss),
+                                               dimnames = list(rownames(val), miss)))
+    val <- val[, feature_genes, drop = FALSE]
+    y_val <- as.numeric(group == "Tumor")
+
+    p_l <- as.numeric(predict(lasso_cv, newx = val, s = "lambda.min", type = "response"))
+    p_e <- as.numeric(predict(enet_cv,  newx = val, s = "lambda.min", type = "response"))
+    p_r <- predict(rf_model, newdata = val, type = "prob")[, "Tumor"]
+    r_l <- roc(y_val, p_l, quiet = TRUE); r_e <- roc(y_val, p_e, quiet = TRUE)
+    r_r <- roc(y_val, p_r, quiet = TRUE)
+    cat("GSE77509 AUC | Lasso:", round(auc(r_l), 3), "| ElasticNet:", round(auc(r_e), 3),
+        "| RF:", round(auc(r_r), 3), "\n")
+
+    plot_roc <- function(r, title) {
+      d <- data.frame(FPR = 1 - r$specificities, TPR = r$sensitivities)
+      d <- d[order(d$FPR, d$TPR), ]
+      ggplot(d, aes(FPR, TPR)) + geom_step(colour = "#E74C3C", linewidth = 1.2) +
+        geom_abline(colour = "grey60") +
+        annotate("text", x = 0.68, y = 0.06, size = 3.5,
+                 label = paste0("AUC: ", round(as.numeric(auc(r)), 3))) +
+        labs(title = title, x = "1 - Specificity", y = "Sensitivity") +
+        theme_bw() + theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+                           panel.grid = element_blank())
+    }
+    g <- grid.arrange(plot_roc(r_r, "ROC of Random.Forest"), plot_roc(r_l, "ROC of Lasso"),
+                      plot_roc(r_e, "ROC of ElasticNet"), ncol = 3)
+    ggsave(P("figures", "Fig4_Validation_ROC_GSE77509.pdf"), g, width = 12, height = 4, dpi = 300)
+    write.csv(data.frame(Model = c("Lasso", "ElasticNet", "RandomForest"),
+                         AUC = c(auc(r_l), auc(r_e), auc(r_r)),
+                         GenesFound = length(common), GenesTotal = length(feature_genes)),
+              P("results", "GSE77509_validation_AUC.csv"), row.names = FALSE)
+  }
+}
+cat("Done.\n")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 ####################################PART 4 — MACHINE LEARNING  ###################################
 library(glmnet); library(randomForest); library(caret); library(pROC)
