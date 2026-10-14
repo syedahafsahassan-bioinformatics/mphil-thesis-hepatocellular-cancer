@@ -95,6 +95,52 @@ cat("Samples remaining:", nrow(expr_clean))  # → 418
 keep_genes <- rowSums(expr_data > 0) >= (0.5 * ncol(expr_data))
 expr_filtered <- expr_data[keep_genes, ]
 
+# gene connectivity WITHOUT building the full gene x gene matrix (RAM-safe)
+# =============================================================================
+# Fig1A_scale_free_power5.R
+# Fig 1A: histogram of connectivity k + scale-free topology check, power = 5
+# Saves to D:/Bioinfo/figures
+# =============================================================================
+source("D:/Bioinfo/scripts/config.R")
+library(WGCNA)
+
+soft_power <- 5                                   # power used for this figure
+
+# use expr_clean from the current session, otherwise load it from disk
+if (!exists("expr_clean")) load(P("rds", "LIHC_WGCNA_results.RData"))
+cat("expr_clean:", nrow(expr_clean), "samples x", ncol(expr_clean), "genes\n")
+
+# ---- connectivity from the full adjacency matrix (~2.3 GB) -------------------
+adj <- adjacency(expr_clean, power = soft_power, type = "unsigned")
+k   <- rowSums(adj) - 1                          # connectivity, excluding self
+rm(adj); gc()
+cat("power", soft_power, "| mean k =", round(mean(k), 2),
+    "| median k =", round(median(k), 2), "| max k =", round(max(k), 1), "\n")
+
+# ---- scale-free fit statistics (printed so you can quote them) --------------
+print(scaleFreeFitIndex(k, nBreaks = 10))
+
+# ---- figure 1 A-----------------------------------------------------------------
+draw_fig <- function() {
+  par(mfrow = c(1, 2), mar = c(5, 5, 4, 2))
+  hist(k, breaks = 30, main = "Histogram of k", xlab = "k", ylab = "Frequency",
+       col = "lightgray", border = "gray40", cex.main = 1.3, cex.lab = 1.2)
+  scaleFreePlot(k, main = paste0("Check scale free topology (power ", soft_power, ")\n"),
+                no.breaks = 10, cex.main = 1.3, cex.lab = 1.2)
+}
+
+pdf(P("figures", "Fig1A_ScaleFree_power5.pdf"), width = 10, height = 5)
+draw_fig()
+dev.off()
+
+png(P("figures", "Fig1A_ScaleFree_power5.png"), width = 3000, height = 1500, res = 300)
+draw_fig()
+dev.off()
+
+draw_fig()                                       # also show it in RStudio
+cat("Saved to", P("figures"), "\n")
+
+
 # Transpose for WGCNA and remove NAs
 expr_clean <- t(na.omit(expr_filtered))
 cat("Genes retained:", ncol(expr_clean))  # → 16,909
@@ -121,26 +167,24 @@ cat("Trait matrix:", dim(traitData))
 
 allowWGCNAThreads()
 
-# Test range of powers
+# ---- 4. Soft threshold (Fig 1A/B) ------------------------------------------
 powers <- c(1:10, seq(12, 20, 2))
-sft <- pickSoftThreshold(
-  expr_clean,
-  powerVector = powers,   
-  verbose = 5,
-  networkType = "unsigned"
-)
-# Plot scale-free topology fit (choose power where R² ≥ 0.80)
-plot(sft$fitIndices[,1],
-     -sign(sft$fitIndices[,3]) * sft$fitIndices[,2],
-     xlab = "Soft Threshold (power)",
-     ylab = "Scale Free Topology Model Fit (R²)",
-     type = "n")
-text(sft$fitIndices[,1],
-     -sign(sft$fitIndices[,3]) * sft$fitIndices[,2],
+sft <- pickSoftThreshold(expr_clean, powerVector = powers,
+                         networkType = "unsigned", verbose = 5)
+
+pdf(P("figures", "Fig1B_SoftThreshold.pdf"), width = 10, height = 5)
+par(mfrow = c(1, 2))
+plot(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     xlab = "Soft Threshold (power)", ylab = "Scale Free Topology Model Fit (R^2)",
+     type = "n", main = "Scale independence")
+text(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
      labels = powers, col = "red")
-abline(h = 0.80, col = "red")
-# Set chosen soft power
-softPower <- 5   # adjust based on plot
+abline(h = 0.8, col = "red")
+plot(sft$fitIndices[, 1], sft$fitIndices[, 5],
+     xlab = "Soft Threshold (power)", ylab = "Mean Connectivity",
+     type = "n", main = "Mean connectivity")
+text(sft$fitIndices[, 1], sft$fitIndices[, 5], labels = powers, col = "red")
+dev.off()
 # Force WGCNA to use its own cor() function
 cor <- WGCNA::cor
 
@@ -158,6 +202,8 @@ net <- blockwiseModules(
   nThreads          = 1,
   verbose           = 3
 )
+
+
 # Restore original cor()
 cor <- stats::cor
 
@@ -168,6 +214,7 @@ table(mergedColors)
 # Save progress immediately
 save(net, expr_clean, traitData, mergedColors,
      file = "LIHC_WGCNA_network.RData")
+
 # Fig1B: Gene dendrogram with module colors
 plotDendroAndColors(
   net$dendrograms[[1]],
@@ -177,27 +224,64 @@ plotDendroAndColors(
   addGuide = TRUE, guideHang = 0.05,
   main = "Gene Dendrogram and Module Colors"
 )
-# Network heatmap (memory-efficient — 400 genes only)
-expr_genes   <- colnames(expr_clean)
-network_genes <- names(net$colors)
-common_genes  <- intersect(expr_genes, network_genes)
-mergedColors  <- labels2colors(net$colors[common_genes])   
-# Select 400 non-grey genes
-set.seed(42)
-assigned_idx <- which(mergedColors != "grey")
-select_idx   <- sample(assigned_idx, min(400, length(assigned_idx)))
-select_colors <- mergedColors[select_idx]
-expr_select   <- expr_clean[, common_genes][, select_idx]
-# Compute adjacency that is the direct connection between the 400 genes + TOM that is the same neighbors for subset only
-adj_select  <- adjacency(expr_select, power = softPower, type = "unsigned")
-TOM_select  <- TOMsimilarity(adj_select)
-#TOM represents similarity so we convert it into dissimilarity that is important for heirarcial clustering
-dissTOM     <- 1 - TOM_select
-gene_tree   <- hclust(as.dist(dissTOM), method = "average")
-TOMplot(dissim = dissTOM, dendro = gene_tree,
-        Colors = select_colors,
-        main   = "Network heatmap — selected genes")
-rm(adj_select, TOM_select, dissTOM); gc()
+
+
+# ---- Network heatmap (TOM plot) of selected assigned genes -------------------
+library(WGCNA)
+
+n_heat     <- 1000      # total genes to plot (the paper used 400)
+per_module <- NULL      # e.g. 120 = up to 120 genes from EVERY module; NULL = random sample
+
+set.seed(SEED)
+assigned <- which(mergedColors != "grey")
+
+if (is.null(per_module)) {
+  sel <- sample(assigned, min(n_heat, length(assigned)))
+} else {
+  sel <- unlist(lapply(setdiff(unique(mergedColors), "grey"), function(mc) {
+    g <- which(mergedColors == mc)
+    sample(g, min(per_module, length(g)))
+  }))
+}
+cat("Genes in heatmap:", length(sel), "\n")
+
+# TOM recomputed from the selected genes only
+adj_sel  <- adjacency(expr_clean[, sel], power = soft_power, type = "unsigned")
+diss_sel <- 1 - TOMsimilarity(adj_sel)
+tree_sel <- hclust(as.dist(diss_sel), method = "average")
+
+pdf(P("figures", "Fig1C_NetworkHeatmap.pdf"), width = 8, height = 8)
+TOMplot(diss_sel^soft_power, tree_sel, Colors = mergedColors[sel],
+        main = paste0("Network heatmap plot, ", length(sel), " selected genes"))
+dev.off()
+
+rm(adj_sel, diss_sel, tree_sel); gc()
+
+> # ---- 7. Module-trait relationships (Fig 1D) --------------------------------
+> MEs <- orderMEs(moduleEigengenes(expr_clean, mergedColors)$eigengenes)
+> MEs <- MEs[, colnames(MEs) != "MEgrey"]
+> moduleTraitCor  <- cor(MEs, traitData, use = "p")
+> moduleTraitPval <- corPvalueStudent(moduleTraitCor, nrow(expr_clean))
+> textMatrix <- matrix(paste0(signif(moduleTraitCor, 2), "\n(",
+                             signif(moduleTraitPval, 1), ")"),
+                      nrow = nrow(moduleTraitCor))
+> pdf(P("figures", "Fig1D_ModuleTraitHeatmap.pdf"), width = 6, height = 10)
+> par(mar = c(6, 9, 3, 3))
+> labeledHeatmap(Matrix = moduleTraitCor, xLabels = colnames(traitData),
+                yLabels = names(MEs), ySymbols = gsub("^ME", "", names(MEs)),
+                colorLabels = FALSE,
+                colors = colorRampPalette(c("navy", "white", "firebrick3"))(75),
+                textMatrix = textMatrix, setStdMargins = FALSE,
+                cex.text = 0.5, zlim = c(-1, 1),
+                main = "Module-Trait Relationships (HCC, TCGA-LIHC)")
+> dev.off()
+
+> sig_mask <- abs(moduleTraitCor[, "Tumor"]) > sig_cor_cutoff &
++   moduleTraitPval[, "Tumor"] < 0.05
+> sig_module_colors <- gsub("^ME", "", rownames(moduleTraitCor)[sig_mask])
+> cat("Significant modules:", paste(sig_module_colors, collapse = ", "), "\n")
+
+
 # Calculate module eigengenes (exclude grey)
 MEs0 <- moduleEigengenes(expr_clean, mergedColors)$eigengenes
 MEs  <- orderMEs(MEs0)
@@ -232,151 +316,512 @@ labeledHeatmap(
   zlim       = c(-1, 1),
   main       = "Module-Trait Relationships (HCC — TCGA LIHC)"
 )
-# Identify significant modules (|r| > 0.3, p < 0.05)
-sig_mask    <- abs(moduleTraitCor[, "Tumor"]) > 0.3 & moduleTraitPval[, "Tumor"] < 0.05
-sig_modules <- names(MEs)[sig_mask]
-cat("Significant modules:", length(sig_modules))
-# Calculate Gene Significance for tumor trait
-geneTraitSignificance <- as.data.frame(
-  cor(expr_clean, traitData_new[, "Tumor", drop=FALSE], use = "p")
+#########################################################################3
+#############SELECTING THE TOP MODULES####################################
+# ---------------------------------------------------------
+# Select significant modules positively correlated with Tumor
+# ---------------------------------------------------------
+
+cor_cutoff <- 0.30
+p_cutoff <- 0.05
+
+# Create module summary
+module_summary <- data.frame(
+  Module = rownames(moduleTraitCor),
+  Correlation = moduleTraitCor[, "Tumor"],
+  P_value = moduleTraitPval[, "Tumor"]
 )
+
+# Remove grey module
+module_summary <- module_summary[
+  module_summary$Module != "MEgrey",
+]
+
+# Keep only positively correlated and significant modules
+positive_modules <- module_summary[
+  module_summary$Correlation > cor_cutoff &
+    module_summary$P_value < p_cutoff,
+]
+
+# Rank from strongest to weakest correlation
+positive_modules <- positive_modules[
+  order(positive_modules$Correlation, decreasing = TRUE),
+]
+
+# Select the top 2 modules
+top_modules <- head(positive_modules, 2)
+
+# Display results
+top_modules
+
+
+
+# ---- 8. Module membership vs gene significance (Fig 1E) --------------------
+sig_module_colors <- c("purple", "red")
+
+geneModuleMembership  <- as.data.frame(cor(expr_clean, MEs, use = "p"))
+geneTraitSignificance <- as.data.frame(cor(expr_clean, traitData$Tumor, use = "p"))
 colnames(geneTraitSignificance) <- "GS.Tumor"
-# Calculate Module Membership for all modules
-geneModuleMembership <- as.data.frame(cor(expr_clean, MEs, use = "p"))
-# Plot MM vs GS for each significant module
-sig_module_colors <- gsub("ME", "", sig_modules)
-sig_module_colors <- sig_module_colors[sig_module_colors != "grey"]
-pdf("Fig1E_MM_vs_GS.pdf", width = 6 * length(sig_module_colors), height = 6)
-par(mfrow = c(1, length(sig_module_colors)))
-for (mod_color in sig_module_colors) {
-  MM_col    <- paste0("ME", mod_color)
-  mod_genes <- mergedColors == mod_color
-  MM_vals   <- as.numeric(geneModuleMembership[mod_genes, MM_col])
-  GS_vals   <- as.numeric(geneTraitSignificance[mod_genes, "GS.Tumor"])
-  valid     <- complete.cases(MM_vals, GS_vals)
-  MM_vals   <- MM_vals[valid]; GS_vals <- GS_vals[valid]
-  if (length(MM_vals) < 3) next
-  cor_val   <- cor(MM_vals, GS_vals)
-  p_val     <- cor.test(MM_vals, GS_vals)$p.value
-  plot(MM_vals, GS_vals,
-    xlab = paste0("Module Membership (", mod_color, ")"),
-    ylab = "Gene Significance (Tumor)",
-    main = paste0(mod_color, "\ncor=", round(cor_val,2), ", p=", signif(p_val,2)),
-    pch = 21, col = "grey60", bg = mod_color)
-  abline(lm(GS_vals ~ MM_vals), col = "red")
+
+# look of the figure ---------------------------------------------------------
+dot_col   <- "red"      # "red" like the paper; NULL = colour each panel by its module colour
+dot_cex   <- 0.7        # dot size
+dot_lwd   <- 0.9        # outline thickness (makes the open circles crisp)
+mm_cut    <- 0.8        # vertical dashed line
+gs_cut    <- 0.2        # horizontal dashed line
+
+n_mod <- max(length(sig_module_colors), 1)
+pdf(P("figures", "Fig1E_MM_vs_GS.pdf"), width = 4.6 * n_mod, height = 4)
+par(mfrow = c(1, n_mod),
+    mar = c(3.6, 3.6, 3.2, 1), mgp = c(2.1, 0.6, 0), tcl = -0.3,
+    cex.axis = 0.7, cex.lab = 0.8, las = 0, lwd = 0.8)
+
+for (mc in sig_module_colors) {
+  in_mod <- mergedColors == mc
+  mm <- abs(geneModuleMembership[in_mod, paste0("ME", mc)])
+  gs <- abs(geneTraitSignificance[in_mod, "GS.Tumor"])
+  ok <- complete.cases(mm, gs)
+  if (sum(ok) < 3) next
+  mm <- mm[ok]; gs <- gs[ok]
+  ct <- cor.test(mm, gs)
+  
+  plot(mm, gs, type = "n",
+       xlim = range(c(mm, mm_cut)), ylim = range(c(gs, gs_cut)),
+       xlab = "Module membership", ylab = "Gene significance",
+       main = "", bty = "o")
+  points(mm, gs, pch = 1, cex = dot_cex, lwd = dot_lwd,
+         col = if (is.null(dot_col)) mc else dot_col)
+  abline(v = mm_cut, h = gs_cut, lty = 2, lwd = 1, col = "black")
+  mtext(paste0("Tumor(", mc, ")"), side = 3, line = 1.7, font = 2, cex = 0.8)
+  mtext(paste0("cor=", round(ct$estimate, 2), ", p=", signif(ct$p.value, 2)),
+        side = 3, line = 0.6, font = 2, cex = 0.7)
 }
 dev.off()
-# Map color labels to gene names
-mergedColors       <- as.character(mergedColors)
-names(mergedColors) <- colnames(expr_clean)
-# Remove grey from significant modules
-sig_module_colors <- gsub("^ME", "", sig_modules)
-sig_module_colors <- sig_module_colors[sig_module_colors != "grey"]
-# Extract genes per module
-module_genes_list <- list()
-for (mod in sig_module_colors) {
-  genes <- names(mergedColors)[mergedColors == mod]
-  module_genes_list[[mod]] <- genes
-  cat("Module", mod, ":", length(genes), "genes\n")
+
+# ---- 9. Co-expressed genes from significant modules ------------------------
+module_genes_list <- lapply(sig_module_colors, function(mc) names(mergedColors)[mergedColors == mc])
+names(module_genes_list) <- sig_module_colors
+for (mc in sig_module_colors) cat("Module", mc, ":", length(module_genes_list[[mc]]), "genes\n")
+coexpressed_genes <- unique(unlist(module_genes_list))
+cat("Total co-expressed genes:", length(coexpressed_genes), "\n")
+
+gs_tumor <- setNames(geneTraitSignificance$GS.Tumor, rownames(geneTraitSignificance))
+write.csv(data.frame(Gene = coexpressed_genes,
+                     Module = mergedColors[coexpressed_genes],
+                     GS_Tumor = gs_tumor[coexpressed_genes]),
+          P("results", "HCC_coexpressed_genes.csv"), row.names = FALSE)
+
+save(expr_clean, traitData, mergedColors, sig_module_colors, coexpressed_genes,
+     gs_tumor, MEs, moduleTraitCor, moduleTraitPval,
+     file = P("rds", "LIHC_WGCNA_results.RData"))
+cat("Done. Results in D:/Bioinfo/results and figures in D:/Bioinfo/figures\n")
+
+
+######################
+################### enrichment analysis################################
+# =============================================================================
+# 03_enrichment.R
+# GO (BP/CC/MF), KEGG and Reactome GSEA on co-expressed genes  (paper Fig 2)
+# =============================================================================
+source("D:/Bioinfo/scripts/config.R")
+# 1. Install BiocManager
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
 }
 
-# Combine into single unique gene list
-coexpressed_genes <- unique(unlist(module_genes_list))
-cat("Total co-expressed genes:", length(coexpressed_genes))
+# 2. Install CRAN packages
+install.packages(c(
+  "DBI",
+  "dplyr",
+  "ggplot2",
+  "igraph",
+  "ggforce",
+  "stringr"
+))
 
-# Save
-write.csv(data.frame(Gene = coexpressed_genes),
-          "HCC_coexpressed_genes.csv", row.names = FALSE)
-library(clusterProfiler); library(org.Hs.eg.db)
-library(igraph); library(ggplot2); library(ggforce)
+# 3. Install Bioconductor packages and dependencies
+BiocManager::install(
+  c(
+    "clusterProfiler",
+    "org.Hs.eg.db",
+    "enrichplot",
+    "ReactomePA"
+  ),
+  ask = FALSE,
+  update = FALSE
+)
+# Install DBI
+install.packages("DBI", repos = "https://cloud.r-project.org")
 
-# Convert gene symbols to Entrez IDs
-gene_ids <- bitr(coexpressed_genes,
-  fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
-# GO Biological Process enrichment
-go_bp <- enrichGO(gene = gene_ids$ENTREZID, OrgDb = org.Hs.eg.db,
-  keyType = "ENTREZID", ont = "BP",
-  pAdjustMethod = "BH", qvalueCutoff = 0.05)
-# Compute pairwise term similarity
-go_bp_sim <- pairwise_termsim(go_bp)
-# Build network from top 30 terms
-top_terms  <- go_bp@result$Description[1:30]
-sim_sub    <- go_bp_sim@termsim[top_terms, top_terms]
-sim_sub[is.na(sim_sub)] <- 0; sim_sub[sim_sub < 0.02] <- 0
-g <- graph_from_adjacency_matrix(sim_sub, mode="undirected", weighted=TRUE, diag=FALSE)
-# Fruchterman-Reingold layout
-set.seed(42)
-layout_coords <- layout_with_fr(g)
-coords <- as.data.frame(layout_coords)
-colnames(coords) <- c("x","y"); coords$name <- V(g)$name
-# Node data (size = gene count, color = p.adjust)
-node_df <- data.frame(name=V(g)$name, x=coords$x, y=coords$y)
-node_df$p.adjust <- go_bp@result$p.adjust[match(node_df$name, go_bp@result$Description)]
-node_df$size     <- go_bp@result$Count[match(node_df$name, go_bp@result$Description)]
-# Louvain clustering for node grouping
-clusters <- cluster_louvain(g)
-node_df$cluster <- as.factor(membership(clusters))
-# Edge coordinates
-edge_list   <- as.data.frame(as_edgelist(g))
-colnames(edge_list) <- c("from","to")
-edge_coords <- merge(merge(edge_list, coords, by.x="from", by.y="name"),
-                     coords, by.x="to", by.y="name", suffixes=c("_from","_to"))
-# Cluster label = most significant term per cluster
-cluster_labels <- node_df %>% group_by(cluster) %>%
-  slice_min(order_by=p.adjust, n=1) %>%
-  summarise(label=first(name), x=mean(x), y=mean(y), .groups="drop")
+# Check whether DBI is installed
+"DBI" %in% rownames(installed.packages())
 
-# Plot
-p_bp <- ggplot() +
-  geom_segment(data=edge_coords,
-    aes(x=x_from, y=y_from, xend=x_to, yend=y_to),
-    color="grey50", linewidth=0.3, alpha=0.7) +
-  geom_point(data=node_df,
-    aes(x=x, y=y, size=size, color=p.adjust), alpha=0.9) +
-  geom_text(data=cluster_labels,
-    aes(x=x+0.4, y=y+0.4, label=stringr::str_wrap(label,25)),
-    size=3, fontface="bold", color="black", hjust=0) +
-  scale_color_gradient(name="p.adjust", low="#D73027", high="#4575B4", trans="reverse") +
-  scale_size_continuous(name="pathway size", range=c(2,8)) +
-  ggtitle("GO Biological Process Enrichment Network") +
-  theme_void()
+# Load DBI
+library(DBI)
+.libPaths()
+find.package("DBI", quiet = TRUE)
+# Install the missing dependency
+install.packages(
+  "RSQLite",
+  repos = "https://cloud.r-project.org",
+  dependencies = TRUE
+)
 
-ggsave("Fig2A_GO_BP_network.pdf", plot=p_bp, width=12, height=10, dpi=300)
+# Check installation
+find.package("RSQLite", quiet = TRUE)
+# Install the missing Bioconductor dependency
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
 
-# Repeat same steps for CC (go_cc) and MF (go_mf) — save as Fig2B and Fig2C
-############################9B · Reactome GSEA (Fig2D)#######################################
+BiocManager::install("GO.db", ask = FALSE, update = FALSE)
+
+# Check installation
+find.package("GO.db", quiet = TRUE)
+
+
+
+
+# Create a package library inside D:/Bioinfo
+bioinfo_lib <- "D:/Bioinfo/R/library"
+
+dir.create(
+  bioinfo_lib,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# Make D:/Bioinfo/R/library the first package library
+.libPaths(c(bioinfo_lib, .libPaths()))
+
+# Check library locations
+.libPaths()
+# CRAN packages and dependencies
+install.packages(
+  c(
+    "DBI",
+    "RSQLite",
+    "dplyr",
+    "ggplot2",
+    "igraph",
+    "ggforce",
+    "stringr"
+  ),
+  lib = bioinfo_lib,
+  repos = "https://cloud.r-project.org",
+  dependencies = TRUE
+)
+
+# Ensure BiocManager is available
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages(
+    "BiocManager",
+    lib = bioinfo_lib,
+    repos = "https://cloud.r-project.org"
+  )
+}
+
+# Bioconductor packages and their dependencies
+BiocManager::install(
+  c(
+    "clusterProfiler",
+    "org.Hs.eg.db",
+    "enrichplot",
+    "ReactomePA",
+    "GO.db"
+  ),
+  lib = bioinfo_lib,
+  ask = FALSE,
+  update = FALSE
+)
+# packages installed in D:/Bioinfo/R/library must be re-added after every restart
+.libPaths(c("D:/Bioinfo/R/library", .libPaths()))
+
+# settings (config.R is NOT sourced here, see the warning below)
+base_dir <- "D:/Bioinfo"
+P <- function(...) file.path(base_dir, ...)
+setwd(base_dir)
+SEED <- 42; set.seed(SEED)
+cut_height <- 310; min_module_size <- 30; merge_cut <- 0.25
+max_block_size <- 5000; sig_cor_cutoff <- 0.3
+
+library(WGCNA); library(dplyr); library(ggplot2)
+options(stringsAsFactors = FALSE)
+
+expr_data     <- readRDS(P("rds", "TCGA_LIHC_expr.rds"))
+clinical_data <- readRDS(P("rds", "TCGA_LIHC_clinical.rds"))
+gse77509      <- readRDS(P("rds", "GSE77509_eset.rds"))
+
+load(P("rds", "LIHC_WGCNA_network.RData"))   # net, expr_clean, traitData, clinical_matched, mergedColors, soft_power
+load(P("rds", "LIHC_WGCNA_results.RData"))   # + sig_module_colors, coexpressed_genes, gs_tumor, MEs, moduleTraitCor, moduleTraitPval
+cat("soft_power =", soft_power, "| samples:", nrow(expr_clean), "| genes:", ncol(expr_clean), "\n")
+
+.libPaths(c("D:/Bioinfo/R/library", .libPaths()))
+.libPaths()
+find.package("aisdk", quiet = TRUE)
+
+install.packages("aisdk")
+library(clusterProfiler)
+# Make sure D:/Bioinfo/R/library is first
+.libPaths(c("D:/Bioinfo/R/library", .libPaths()))
+
+# Install tidytree
+BiocManager::install(
+  "tidytree",
+  lib = "D:/Bioinfo/R/library",
+  ask = FALSE,
+  update = FALSE
+)
+
+# Check
+find.package("tidytree", quiet = TRUE)
+
+
+
+
+
+
+
+
+
+# Make D drive library the first priority
+.libPaths(c("D:/Bioinfo/R/library", .libPaths()))
+
+# Make sure BiocManager is installed
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages(
+    "BiocManager",
+    lib = "D:/Bioinfo/R/library",
+    repos = "https://cloud.r-project.org"
+  )
+}
+
+# Install enrichplot specifically to D drive
+BiocManager::install(
+  "enrichplot",
+  lib = "D:/Bioinfo/R/library",
+  ask = FALSE,
+  update = FALSE
+)
+install.packages(
+  "ggiraph",
+  lib = "D:/Bioinfo/R/library",
+  repos = "https://cloud.r-project.org",
+  dependencies = TRUE
+)
+
+find.package("ggiraph", quiet = TRUE)
+# Check that it exists
+find.package("enrichplot", quiet = TRUE)
+.libPaths(c("D:/Bioinfo/R/library", .libPaths()))
+
+BiocManager::install(
+  "enrichplot",
+  lib = "D:/Bioinfo/R/library",
+  ask = FALSE,
+  update = FALSE
+)
+# Load it
+library(enrichplot)
+find.package("enrichplot", quiet = TRUE)
+# Set your D-drive package library
+bioinfo_lib <- "D:/Bioinfo/R/library"
+dir.create(bioinfo_lib, recursive = TRUE, showWarnings = FALSE)
+.libPaths(c(bioinfo_lib, .libPaths()))
+
+# Install BiocManager if needed
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages(
+    "BiocManager",
+    lib = bioinfo_lib,
+    repos = "https://cloud.r-project.org"
+  )
+}
+
+# Install the required packages and their dependencies together
+BiocManager::install(
+  c(
+    "gson",
+    "clusterProfiler",
+    "enrichplot",
+    "org.Hs.eg.db",
+    "ReactomePA"
+  ),
+  lib = bioinfo_lib,
+  dependencies = TRUE,
+  ask = FALSE,
+  update = FALSE
+)
+# Try loading clusterProfiler again
+library(clusterProfiler)
+# Load the packages
+library(RSQLite)
+library(clusterProfiler)
+# 4. Test whether all packages load successfully
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+bioinfo_lib <- "D:/Bioinfo/R/library"
+.libPaths(c(bioinfo_lib, .libPaths()))
+
+install.packages(
+  "ggraph",
+  lib = bioinfo_lib,
+  repos = "https://cloud.r-project.org",
+  dependencies = TRUE
+)
+bioinfo_lib <- "D:/Bioinfo/R/library"
+.libPaths(c(bioinfo_lib, .libPaths()))
+
+BiocManager::install(
+  "reactome.db",
+  lib = bioinfo_lib,
+  ask = FALSE,
+  update = FALSE
+)
 library(ReactomePA)
+library(dplyr)
+library(ggplot2)
+library(igraph)
+library(ggforce)
+library(stringr)
 
-# Convert co-expressed genes to Entrez IDs for ranking
-coexpr_entrez <- bitr(coexpressed_genes,
-  fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+# 5. Confirm installation
+cat("All packages loaded successfully!\n")
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(ReactomePA)
+library(dplyr)
+library(ggplot2)
+library(igraph)
+library(ggforce)
+library(stringr)
 
-# Create ranked gene list (use absolute values, sorted decreasing)
-ranked_subset <- sort(abs(ranked_final[names(ranked_final) %in% coexpr_entrez$ENTREZID]),
-                      decreasing = TRUE)
+load(P("rds", "LIHC_WGCNA_results.RData"))    # coexpressed_genes, gs_tumor
 
-# Run GSEA on Reactome pathways
-set.seed(42)
-gsea_reactome <- gsePathway(
-  geneList    = ranked_subset,
-  organism    = "human",
-  minGSSize   = 5,
-  maxGSSize   = 500,
-  pvalueCutoff = 0.05,
-  verbose     = TRUE
+gene_ids <- bitr(coexpressed_genes, fromType = "SYMBOL", toType = "ENTREZID",
+                 OrgDb = org.Hs.eg.db)
+cat("Genes mapped to Entrez:", nrow(gene_ids), "of", length(coexpressed_genes), "\n")
+
+# ---- GO enrichment ----------------------------------------------------------
+run_go <- function(ont) {
+  enrichGO(gene = gene_ids$ENTREZID, OrgDb = org.Hs.eg.db, keyType = "ENTREZID",
+           ont = ont, pAdjustMethod = "BH", pvalueCutoff = 0.05,
+           qvalueCutoff = 0.05, readable = TRUE)
+}
+go_bp <- run_go("BP"); go_cc <- run_go("CC"); go_mf <- run_go("MF")
+options(timeout = 300)
+
+kegg_enrich <- enrichKEGG(
+  gene = gene_ids$ENTREZID,
+  organism = "hsa",
+  pvalueCutoff = 0.05
 )
-cat("Pathways found:", nrow(gsea_reactome))  # → 69
+kegg_enrich <- enrichKEGG(gene = gene_ids$ENTREZID, organism = "hsa", pvalueCutoff = 0.05)
 
-# Select top 3 pathways by adjusted p-value
-top_pathways <- gsea_reactome@result %>% arrange(p.adjust) %>% slice(1:3) %>% pull(ID)
+write.csv(as.data.frame(go_bp), P("results", "GO_BP_enrichment.csv"), row.names = FALSE)
+write.csv(as.data.frame(go_cc), P("results", "GO_CC_enrichment.csv"), row.names = FALSE)
+write.csv(as.data.frame(go_mf), P("results", "GO_MF_enrichment.csv"), row.names = FALSE)
+write.csv(as.data.frame(kegg_enrich), P("results", "KEGG_enrichment.csv"), row.names = FALSE)
 
-# Plot GSEA enrichment plot
-p_reactome <- gseaplot2(
-  gsea_reactome, geneSetID = top_pathways,
-  title = "", color = c("red", "green", "blue"),
-  base_size = 11, rel_heights = c(1.5, 0.5, 1), pvalue_table = FALSE
-)
-ggsave("Fig2D_Reactome_GSEA.pdf", plot=p_reactome, width=10, height=7, dpi=300)
+# ---- Network figure (Fig 2A-C) ---------------------------------------------
+enrich_network <- function(obj, title, file, top_n = 25, sim_cut = 0.1) {
+  obj2 <- pairwise_termsim(obj)
+  res  <- obj2@result %>% filter(p.adjust < 0.05) %>% arrange(p.adjust)
+  res  <- res[seq_len(min(top_n, nrow(res))), ]
+  terms <- res$Description
+  sim <- obj2@termsim[terms, terms]
+  sim[is.na(sim)] <- 0
+  sim[sim < sim_cut] <- 0
+  diag(sim) <- 0
+  g <- graph_from_adjacency_matrix(sim, mode = "undirected", weighted = TRUE, diag = FALSE)
+  
+  set.seed(SEED)
+  xy <- as.data.frame(layout_with_fr(g)); colnames(xy) <- c("x", "y"); xy$name <- V(g)$name
+  nodes <- xy
+  nodes$p.adjust <- res$p.adjust[match(nodes$name, res$Description)]
+  nodes$size     <- res$Count[match(nodes$name, res$Description)]
+  nodes$cluster  <- as.factor(membership(cluster_louvain(g)))
+  
+  el <- as.data.frame(as_edgelist(g)); colnames(el) <- c("from", "to")
+  edges <- merge(el, xy, by.x = "from", by.y = "name")
+  edges <- merge(edges, xy, by.x = "to", by.y = "name", suffixes = c("_from", "_to"))
+  
+  labs_df <- nodes %>% group_by(cluster) %>% slice_min(p.adjust, n = 1, with_ties = FALSE) %>%
+    ungroup() %>% select(cluster, label = name)
+  cen <- nodes %>% group_by(cluster) %>%
+    summarise(x0 = mean(x), y0 = mean(y),
+              a = max((max(x) - min(x)) / 2 + 0.3, 0.3),
+              b = max((max(y) - min(y)) / 2 + 0.3, 0.3), .groups = "drop")
+  labs_df <- left_join(labs_df, cen, by = "cluster")
+  
+  p <- ggplot() +
+    geom_ellipse(data = cen, aes(x0 = x0, y0 = y0, a = a, b = b, angle = 0),
+                 fill = NA, colour = "black", linetype = "dashed", linewidth = 0.4) +
+    geom_segment(data = edges, aes(x = x_from, y = y_from, xend = x_to, yend = y_to),
+                 colour = "grey60", linewidth = 0.3, alpha = 0.7) +
+    geom_point(data = nodes, aes(x = x, y = y, size = size, colour = p.adjust), alpha = 0.9) +
+    geom_text(data = labs_df, aes(x = x0 + 0.4, y = y0 + 0.4, label = str_wrap(label, 25)),
+              size = 3, fontface = "bold", hjust = 0) +
+    scale_size_continuous(name = "Pathway size", range = c(2, 8)) +
+    scale_colour_gradient(name = "p.adjust", low = "#D73027", high = "#4575B4", trans = "reverse") +
+    ggtitle(title) + theme_void() +
+    theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+  ggsave(file, plot = p, width = 12, height = 10, dpi = 300)
+  invisible(p)
+}
+library(dplyr)
+library(AnnotationDbi)
+
+select <- dplyr::select
+enrich_network
+
+
+enrich_network(go_bp, "GO Biological Process Enrichment Network", P("figures", "Fig2A_GO_BP_network.pdf"), sim_cut = 0.02)
+enrich_network(go_cc, "GO Cellular Component Enrichment Network", P("figures", "Fig2B_GO_CC_network.pdf"))
+enrich_network(go_mf, "GO Molecular Function Enrichment Network", P("figures", "Fig2C_GO_MF_network.pdf"))
+
+# ---- Reactome GSEA (Fig 2D) -------------------------------------------------
+# Rank the co-expressed genes by |gene significance for Tumor| (WGCNA), Entrez IDs
+ranked <- abs(gs_tumor[gene_ids$SYMBOL])
+names(ranked) <- gene_ids$ENTREZID
+ranked <- sort(ranked[!is.na(ranked) & !duplicated(names(ranked))], decreasing = TRUE)
+
+set.seed(SEED)
+gsea_reactome <- gsePathway(geneList = ranked, organism = "human",
+                            minGSSize = 5, maxGSSize = 500,
+                            pvalueCutoff = 0.05, verbose = TRUE)
+cat("Reactome pathways found:", nrow(gsea_reactome), "\n")
+write.csv(as.data.frame(gsea_reactome), P("results", "Reactome_GSEA.csv"), row.names = FALSE)
+
+if (nrow(gsea_reactome@result) >= 1) {
+  
+  top_ids <- gsea_reactome@result %>%
+    dplyr::arrange(p.adjust) %>%
+    dplyr::slice_head(n = 3) %>%
+    dplyr::pull(ID)
+  
+  p_re <- gseaplot2(
+    gsea_reactome,
+    geneSetID = top_ids,
+    title = "",
+    color = c("red", "green", "blue")[seq_along(top_ids)],
+    base_size = 11,
+    rel_heights = c(1.5, 0.5, 1),
+    pvalue_table = FALSE
+  )
+  
+  ggsave(
+    P("figures", "Fig2D_Reactome_GSEA.pdf"),
+    plot = p_re,
+    width = 10,
+    height = 7,
+    dpi = 300
+  )
+}
+cat("Done.\n")
+
 ####################################PART 4 — MACHINE LEARNING  ###################################
 library(glmnet); library(randomForest); library(caret); library(pROC)
 
