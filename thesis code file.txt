@@ -1457,6 +1457,335 @@ write.csv(prop, P("results", "celltype_proportions.csv"), row.names = FALSE)
 cat("Done.\n")
 
 
+# =============================================================================
+# 07_hub_genes_and_DEG_enrichment.R
+# Hub genes = ML feature genes  ∩  scRNA DEGs   (paper Fig 7)
+# =============================================================================
+source("D:/Bioinfo/scripts/config.R")
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(ReactomePA)
+
+all_markers_deg <- read.csv(P("results", "GSE299340_all_markers_deg.csv"))
+gene_counts     <- read.csv(P("results", "HCC_ML_gene_overlap.csv"))
+
+
+
+# ---- Hub genes --------------------------------------------------------------
+# 1. Strict scRNA-seq DEGs
+sig <- all_markers_deg %>%
+  dplyr::filter(
+    p_val_adj < 0.01,
+    avg_log2FC > 1
+  )
+
+scrna_degs <- unique(sig$gene)
+
+# 2. Genes selected by all 3 ML models
+feat_strict <- gene_counts$Gene[gene_counts$Count == 3]
+
+# 3. Identify final hub genes
+hub_genes <- intersect(feat_strict, scrna_degs)
+
+cat("Strict scRNA-seq DEGs:", length(scrna_degs), "\n")
+cat("Genes selected by all 3 ML models:", length(feat_strict), "\n")
+cat("Final hub genes:", length(hub_genes), "\n")
+
+print(hub_genes)
+
+# 4. Save results
+write.csv(
+  data.frame(HubGene = hub_genes),
+  P("results", "HCC_hub_genes.csv"),
+  row.names = FALSE
+)
+
+
+# =============================================================================
+# Fig7_BE_paper_style.R   - Fig 7B-E, tidy publication style
+#   7B  GO Biological Process  -> GO hierarchy graph
+#   7C  GO Cellular Component  -> GO hierarchy graph
+#   7D  GO Molecular Function  -> GO hierarchy graph
+#   7E  KEGG                   -> circular gene-pathway plot
+# Needs only: results/GSE299340_all_markers_deg.csv
+# =============================================================================
+.libPaths(c("D:/Bioinfo/R/library", .libPaths()))
+base_dir <- "D:/Bioinfo"; P <- function(...) file.path(base_dir, ...); setwd(base_dir)
+SEED <- 42; set.seed(SEED); options(timeout = 600)
+
+library(dplyr); library(ggplot2); library(ggrepel); library(RColorBrewer); library(stringr)
+library(clusterProfiler); library(org.Hs.eg.db); library(GO.db); library(igraph)
+
+# ---- look of the figures (edit here) -------------------------------------------
+n_go_terms    <- 10    # enriched GO terms per hierarchy graph
+go_wrap       <- 26    # characters per line in GO labels
+go_label_size <- 2.1   # GO label text size (smaller = neater)
+n_kegg_cats   <- 10    # KEGG pathways in the circular plot
+genes_per_cat <- 20    # genes shown per pathway (the strongest by |log2FC|)
+gene_label_sz <- 2.1   # gene label size in the circular plot
+
+# ---- DEGs (|log2FC| > 1, adj. P < 0.05, as in the paper) -----------------------
+all_markers_deg <- read.csv(P("results", "GSE299340_all_markers_deg.csv"))
+sig <- all_markers_deg %>% dplyr::filter(p_val_adj < 0.05, abs(avg_log2FC) > 1)
+gene_best <- sig %>% group_by(gene) %>% slice_max(abs(avg_log2FC), n = 1, with_ties = FALSE) %>% ungroup()
+ids <- bitr(gene_best$gene, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+gene_best <- inner_join(gene_best, ids, by = c("gene" = "SYMBOL"))
+gene_best <- gene_best[!duplicated(gene_best$ENTREZID), ]
+entrez <- gene_best$ENTREZID
+fc_sym <- setNames(gene_best$avg_log2FC, gene_best$gene)
+cat("DEGs used:", length(entrez), "\n")
+
+# =============================================================================
+# GO hierarchy graph: enriched terms (coloured) + all their ancestors (grey)
+# =============================================================================
+go_dag_plot <- function(ego, ont, n_terms = 10, file, wrap = 26, lab_size = 2.1) {
+  res <- as.data.frame(ego); res <- head(res[order(res$p.adjust), ], n_terms)
+  par_db <- switch(ont, BP = GO.db::GOBPPARENTS, CC = GO.db::GOCCPARENTS, MF = GO.db::GOMFPARENTS)
+  
+  edges <- list(); seen <- character(); queue <- res$ID           # walk up to the root
+  while (length(queue)) {
+    cur <- queue[1]; queue <- queue[-1]
+    if (cur %in% seen) next
+    seen <- c(seen, cur)
+    pr <- tryCatch(AnnotationDbi::mget(cur, par_db, ifnotfound = NA)[[1]], error = function(e) NA)
+    if (all(is.na(pr))) next
+    pr <- pr[pr != "all"]                      # values = parent GO ids, names = relationship
+    if (!length(pr)) next
+    edges[[length(edges) + 1]] <- data.frame(child = cur, parent = as.character(pr), rel = names(pr))
+    queue <- c(queue, as.character(pr))
+  }
+  edges <- do.call(rbind, edges)
+  edges$rel_group <- ifelse(edges$rel == "isa", "is a", ifelse(edges$rel == "part_of", "part of", "regulates"))
+  
+  node_ids <- unique(c(edges$child, edges$parent, res$ID))
+  terms <- AnnotationDbi::select(GO.db::GO.db, keys = node_ids, columns = "TERM", keytype = "GOID")
+  nodes <- data.frame(id = node_ids, term = terms$TERM[match(node_ids, terms$GOID)])
+  nodes$enriched <- nodes$id %in% res$ID
+  nodes$logp <- -log10(res$p.adjust[match(nodes$id, res$ID)])
+  nodes$lab  <- str_wrap(str_trunc(nodes$term, 70), wrap)
+  nodes$face <- ifelse(nodes$enriched, "bold", "plain")
+  
+  g <- igraph::graph_from_data_frame(data.frame(from = edges$parent, to = edges$child),
+                                     directed = TRUE, vertices = data.frame(id = nodes$id))
+  lay <- igraph::layout_with_sugiyama(g)$layout
+  nodes$x <- lay[match(nodes$id, igraph::V(g)$name), 1]
+  nodes$y <- lay[match(nodes$id, igraph::V(g)$name), 2]           # root at the top
+  
+  e2 <- edges %>%
+    left_join(nodes[, c("id", "x", "y")], by = c("parent" = "id")) %>% dplyr::rename(xp = x, yp = y) %>%
+    left_join(nodes[, c("id", "x", "y")], by = c("child"  = "id")) %>% dplyr::rename(xc = x, yc = y)
+  
+  p <- ggplot() +
+    geom_segment(data = e2, aes(x = xp, y = yp, xend = xc, yend = yc, linetype = rel_group),
+                 colour = "grey65", linewidth = 0.3,
+                 arrow = arrow(length = unit(1.1, "mm"), type = "closed")) +
+    geom_point(data = nodes[!nodes$enriched, ], aes(x, y), colour = "grey75", size = 1.4) +
+    geom_point(data = nodes[nodes$enriched, ],  aes(x, y, colour = logp), size = 3) +
+    geom_text_repel(data = nodes, aes(x, y, label = lab, fontface = face),
+                    size = lab_size, lineheight = 0.85, box.padding = 0.12, point.padding = 0.05,
+                    segment.colour = NA, min.segment.length = Inf, max.overlaps = Inf, seed = 42) +
+    scale_colour_gradient(low = "#4575B4", high = "#D73027", name = "-log10\n(adj. P)") +
+    scale_linetype_manual(values = c("is a" = "solid", "part of" = "longdash", "regulates" = "dotted"),
+                          name = "Relationship") +
+    scale_x_continuous(expand = expansion(mult = 0.06)) + scale_y_continuous(expand = expansion(mult = 0.05)) +
+    theme_void() +
+    theme(legend.title = element_text(size = 8, face = "bold"), legend.text = element_text(size = 7),
+          legend.key.size = unit(0.4, "cm"), plot.margin = margin(8, 8, 8, 8))
+  ggsave(file, p, width = 14, height = 10)
+  invisible(p)
+}
+
+for (o in c("BP", "CC", "MF")) {
+  ego <- enrichGO(entrez, OrgDb = org.Hs.eg.db, ont = o, pvalueCutoff = 0.05, qvalueCutoff = 0.05)
+  write.csv(as.data.frame(ego), P("results", paste0("scRNA_DEG_GO_", o, ".csv")), row.names = FALSE)
+  panel <- c(BP = "Fig7B", CC = "Fig7C", MF = "Fig7D")[[o]]
+  if (nrow(as.data.frame(ego)) < 1) { message("No GO ", o, " terms"); next }
+  go_dag_plot(ego, o, n_go_terms, P("figures", paste0(panel, "_GO_", o, "_hierarchy.pdf")),
+              wrap = go_wrap, lab_size = go_label_size)
+}
+
+# =============================================================================
+# Circular KEGG plot
+# =============================================================================
+circular_cnet <- function(enr, fc, n_cat = 10, per_cat = 20, file, lab_size = 2.1) {
+  res <- as.data.frame(enr)
+  res <- res[order(res$p.adjust), ][seq_len(min(n_cat, nrow(res))), ]
+  res$Description <- sub(" - Homo sapiens.*$", "", res$Description)
+  full <- setNames(strsplit(res$geneID, "/"), res$Description)
+  n_full <- lengths(full)
+  gl <- lapply(full, function(g) {                                  # strongest genes per pathway
+    v <- fc[g]; v[is.na(v)] <- 0
+    head(g[order(-abs(v))], per_cat)
+  })
+  genes <- unique(unlist(gl))
+  first_cat <- vapply(genes, function(g) which(vapply(gl, function(x) g %in% x, logical(1)))[1], integer(1))
+  fcv <- fc[genes]; fcv[is.na(fcv)] <- 0
+  genes <- genes[order(first_cat, -fcv)]; fcv <- fc[genes]; fcv[is.na(fcv)] <- 0
+  n <- length(genes)
+  
+  ang <- 2 * pi * (seq_len(n) - 0.5) / n + pi / 2
+  deg <- (ang * 180 / pi) %% 360; left <- deg > 90 & deg < 270
+  gnode <- data.frame(gene = genes, x = cos(ang), y = sin(ang), fc = fcv,
+                      lx = 1.04 * cos(ang), ly = 1.04 * sin(ang),
+                      rot = ifelse(left, deg - 180, deg), hj = ifelse(left, 1, 0))
+  k <- length(gl); t <- 2 * pi * (seq_len(k) - 1) / k
+  cat_names <- str_wrap(names(gl), 30)
+  cnode <- data.frame(category = factor(cat_names, levels = cat_names), count = as.integer(n_full),
+                      x = 0.16 * cos(t), y = 0.4 + 0.16 * sin(t))
+  edges <- do.call(rbind, lapply(seq_len(k), function(i) {
+    g <- gnode[gnode$gene %in% gl[[i]], ]
+    data.frame(category = cnode$category[i], x = cnode$x[i], y = cnode$y[i], xend = g$x, yend = g$y)
+  }))
+  pal <- setNames(colorRampPalette(brewer.pal(12, "Paired"))(k), cat_names)
+  m <- max(2, ceiling(quantile(abs(fcv), 0.95)))
+  
+  p <- ggplot() +
+    geom_segment(data = edges, aes(x = x, y = y, xend = xend, yend = yend, colour = category),
+                 linewidth = 0.3, alpha = 0.5) +
+    geom_point(data = gnode, aes(x, y, fill = fc), shape = 21, size = 1.7, stroke = 0.2, colour = "grey30") +
+    geom_point(data = cnode, aes(x, y, size = count, colour = category)) +
+    geom_text(data = gnode, aes(lx, ly, label = gene, angle = rot, hjust = hj), size = lab_size) +
+    scale_colour_manual(values = pal, name = "Pathway") +
+    scale_fill_gradient2(low = "#3B4CC0", mid = "white", high = "#E41A1C", midpoint = 0,
+                         limits = c(-m, m), oob = scales::squish, name = "log2FC") +
+    scale_size_continuous(range = c(2, 6), name = "Genes in\npathway") +
+    guides(colour = guide_legend(order = 1, override.aes = list(linewidth = 1.2, size = 2.5), ncol = 1)) +
+    coord_fixed(xlim = c(-1.45, 1.45), ylim = c(-1.4, 1.4), clip = "off") +
+    theme_void() +
+    theme(legend.title = element_text(size = 8, face = "bold"), legend.text = element_text(size = 7),
+          legend.key.size = unit(0.4, "cm"), legend.spacing.y = unit(0.15, "cm"))
+  ggsave(file, p, width = 12, height = 8)
+  invisible(p)
+}
+
+kegg <- setReadable(enrichKEGG(entrez, organism = "hsa", pvalueCutoff = 0.05),
+                    OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+write.csv(as.data.frame(kegg), P("results", "scRNA_DEG_KEGG.csv"), row.names = FALSE)
+if (nrow(as.data.frame(kegg)) >= 1) {
+  circular_cnet(kegg, fc_sym, n_cat = n_kegg_cats, per_cat = genes_per_cat,
+                file = P("figures", "Fig7E_KEGG_circular.pdf"), lab_size = gene_label_sz)
+} else message("No significant KEGG pathways.")
+cat("Fig 7B-E done. Files are in", P("figures"), "\n")
+
+
+
+# =============================================================================
+# 08_immune_infiltration.R
+# MCP-counter + CIBERSORTx on the bulk TCGA data, hub-gene vs immune-cell
+# correlations  (paper Fig 8 and Fig 9)
+#
+# CIBERSORTx is a web tool (cannot be run from R):
+#   1. run this script once: it writes  results/HCC_CIBERSORTx_input.txt
+#   2. upload that file at https://cibersortx.stanford.edu  -> module 2 'Impute Cell Fractions'
+#      (LM22 signature, relative mode, 100 permutations, batch correction disabled,
+#      quantile normalisation disabled for RNA-seq)
+#   3. download the results CSV and save it as
+#      D:/Bioinfo/results/CIBERSORTx_Job1_Results.csv
+#   4. run this script again
+# =============================================================================
+source("D:/Bioinfo/scripts/config.R")
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)
+library(linkET)
+library(MCPcounter)
+
+expr_data <- readRDS(P("rds", "TCGA_LIHC_expr.rds"))          # genes x samples (all 423)
+hub_genes <- read.csv(P("results", "HCC_hub_genes.csv"))$HubGene
+hub_present <- hub_genes[hub_genes %in% rownames(expr_data)]
+cat("Hub genes with bulk expression:", length(hub_present), "\n")
+
+group_of <- function(ids) ifelse(grepl("\\.01$", ids), "Tumor",
+                                 ifelse(grepl("\\.11$", ids), "Normal", "Other"))
+hub_expr <- as.data.frame(t(expr_data[hub_present, , drop = FALSE]))
+hub_expr$Mixture <- rownames(hub_expr)
+
+# CIBERSORTx input file. CIBERSORTx expects NON-log values, but TCGA HiSeqV2 is
+# log2(RSEM + 1), so convert back to linear space first.
+lin <- round(2^as.matrix(expr_data) - 1, 4)
+cx  <- cbind(GeneSymbol = rownames(lin), as.data.frame(lin, check.names = FALSE))
+write.table(cx, P("results", "HCC_CIBERSORTx_input.txt"), sep = "\t", row.names = FALSE, quote = FALSE)
+rm(lin, cx); gc()
+
+# ---- helper: fan diagram of hub genes vs immune cells -----------------------
+fan_plot <- function(gene, cell_df, hub_df, file) {
+  m <- inner_join(cell_df, hub_df[, c("Mixture", gene)], by = "Mixture")
+  cells <- setdiff(colnames(cell_df), "Mixture")
+  cells <- cells[sapply(m[, cells], function(x) sd(x, na.rm = TRUE) > 0)]
+  cell_cor <- correlate(m[, cells], method = "spearman")
+  mt <- mantel_test(m[, gene, drop = FALSE], m[, cells], spec_select = setNames(list(1), gene)) %>%
+    mutate(rd = cut(r, breaks = c(-Inf, 0.2, 0.4, Inf), labels = c("< 0.2", "0.2 - 0.4", ">= 0.4")),
+           pd = cut(p, breaks = c(-Inf, 0.01, 0.05, Inf), labels = c("< 0.01", "0.01 - 0.05", ">= 0.05")))
+  p <- qcorrplot(cell_cor, grid_col = "grey70", grid_size = 0.2) +
+    geom_square() +
+    geom_couple(aes(colour = pd, size = rd), data = mt, curvature = 0.1) +
+    scale_fill_gradientn(colours = c("#4575B4", "white", "#D73027"), limits = c(-1, 1), name = "Spearman's R") +
+    scale_size_manual(values = c(0.4, 0.8, 1.6), name = "Mantel r") +
+    scale_colour_manual(values = c("#D73027", "#FDAE61", "grey80"), name = "P-value") +
+    ggtitle(gene) + theme(plot.title = element_text(face = "bold", hjust = 0))
+  ggsave(file, p, width = 9, height = 8, dpi = 300)
+}
+# helper: strongest absolute correlation of each hub gene with any immune cell
+max_cor <- function(cell_df, hub_df) {
+  m <- inner_join(cell_df, hub_df, by = "Mixture")
+  cells <- setdiff(colnames(cell_df), "Mixture")
+  sapply(setdiff(colnames(hub_df), "Mixture"), function(g)
+    max(abs(suppressWarnings(cor(m[[g]], m[, cells], method = "spearman", use = "pairwise"))), na.rm = TRUE))
+}
+boxplot_groups <- function(long, title, ylab, file) {
+  p <- ggplot(long, aes(Cell_Type, Value, fill = group)) +
+    geom_boxplot(outlier.size = 0.3, width = 0.6) +
+    stat_compare_means(aes(group = group), method = "wilcox.test", label = "p.signif", hide.ns = TRUE) +
+    scale_fill_manual(values = c(Tumor = "#E74C3C", Normal = "#3498DB")) +
+    labs(title = title, x = NULL, y = ylab, fill = "Group") + theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          axis.text.x = element_text(angle = 45, hjust = 1), panel.grid = element_blank())
+  ggsave(file, p, width = 13, height = 6, dpi = 300)
+}
+
+# ---- MCP-counter (Fig 9) ----------------------------------------------------
+mcp <- MCPcounter.estimate(as.matrix(expr_data), featuresType = "HUGO_symbols")
+mcp_df <- as.data.frame(t(mcp)); mcp_df$Mixture <- rownames(mcp_df)
+mcp_df <- mcp_df[, c("Mixture", setdiff(colnames(mcp_df), "Mixture"))]
+write.csv(mcp_df, P("results", "MCPcounter_scores.csv"), row.names = FALSE)
+
+mcp_long <- mcp_df %>% mutate(group = group_of(Mixture)) %>% filter(group != "Other") %>%
+  pivot_longer(-c(Mixture, group), names_to = "Cell_Type", values_to = "Value")
+boxplot_groups(mcp_long, "Immune infiltration: Tumor vs Normal (MCP-counter)",
+               "MCP-counter score", P("figures", "Fig9A_MCPcounter_boxplot.pdf"))
+for (g in hub_present) fan_plot(g, mcp_df, hub_expr, P("figures", paste0("Fig9_", g, "_MCPcounter_fan.pdf")))
+mc_mcp <- max_cor(mcp_df, hub_expr)
+
+# ---- CIBERSORTx (Fig 8) -----------------------------------------------------
+cib_file <- P("results", "CIBERSORTx_Job1_Results.csv")
+mc_cib <- NULL
+if (file.exists(cib_file)) {
+  cib <- read.csv(cib_file, check.names = FALSE)
+  cell_cols <- setdiff(colnames(cib), c("Mixture", "P-value", "Correlation", "RMSE"))
+  cib_df <- cib[, c("Mixture", cell_cols)]
+  cib_long <- cib_df %>% mutate(group = group_of(Mixture)) %>% filter(group != "Other") %>%
+    pivot_longer(-c(Mixture, group), names_to = "Cell_Type", values_to = "Value")
+  boxplot_groups(cib_long, "Immune cell fractions: Tumor vs Normal (CIBERSORTx)",
+                 "Fraction", P("figures", "Fig8A_CIBERSORT_boxplot.pdf"))
+  for (g in hub_present) fan_plot(g, cib_df, hub_expr, P("figures", paste0("Fig8_", g, "_CIBERSORT_fan.pdf")))
+  mc_cib <- max_cor(cib_df, hub_expr)
+} else {
+  message("CIBERSORTx results not found (", cib_file, "). Fig 8 skipped; see steps at the top of this script.")
+}
+
+# ---- choose the 3 hub genes with the strongest immune correlation -----------
+score <- if (is.null(mc_cib)) mc_mcp else pmax(mc_mcp, mc_cib)
+top3 <- names(sort(score, decreasing = TRUE))[1:min(3, length(score))]
+cat("Hub genes ranked by strongest immune correlation:\n"); print(round(sort(score, decreasing = TRUE), 3))
+write.csv(data.frame(Gene = names(score), MaxAbsCor = as.numeric(score))[order(-score), ],
+          P("results", "hub_gene_immune_correlation.csv"), row.names = FALSE)
+write.csv(data.frame(Gene = top3), P("results", "top3_hub_genes_for_scRNA.csv"), row.names = FALSE)
+cat("Top 3 hub genes for Fig 10/11:", paste(top3, collapse = ", "), "\nDone.\n")
 
 
 
