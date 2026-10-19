@@ -1,761 +1,396 @@
-# Install BiocManager
-install.packages("BiocManager")
+# =============================================================================
+# 00_install_packages.R   (run once)
+# =============================================================================
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+options(timeout = 7200)
 
-# Bioconductor packages (genomics tools)
-BiocManager::install(c(
-  "WGCNA", "impute", "preprocessCore",
-  "GO.db", "AnnotationDbi", "clusterProfiler",
-  "org.Hs.eg.db", "enrichplot"
-), ask = FALSE)
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
 
-# CRAN packages (visualization & ML)
-install.packages(c(
-  "ggplot2", "dplyr", "tidyr", "pheatmap",
-  "corrplot", "RColorBrewer", "ggrepel",
-  "reshape2", "gridExtra", "glmnet",
-  "randomForest", "caret", "pROC",
-  "dynamicTreeCut", "flashClust"
-))
-# Direct download of TCGA-LIHC HiSeqV2 expression matrix
-url <- https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.LIHC.sampleMap%2FHiSeqV2.gz 
-#Gives R the online address of the TCGA-LIHC gene expression data.
-download.file(url, destfile = "HiSeqV2.gz", mode = "wb")
-#Downloads the data to your computer and saves it as HiSeqV2.gz.
-# Load into R as expression matrix
-expr_data <- read.table(gzfile("HiSeqV2.gz"),
-  header = TRUE, sep = "\t", row.names = 1)
-
-# Verify dimensions
-dim(expr_data)   # should be 20530 genes × 423 samples
-library(WGCNA)
-
-# Transpose: WGCNA needs samples as rows, genes as columns
-expr_t <- t(expr_data)
-
-# Hierarchical clustering to detect outliers
-sampleTree <- hclust(dist(expr_t), method = "average")
-#################Choosing the proper cutoff value#####################################
-
-library(WGCNA)
-
-# Check the candidate cutoffs
-candidate_heights <- c(200, 250, 300, 350, 400, 500)
-
-cutoff_results <- do.call(
-  rbind,
-  lapply(candidate_heights, function(h) {
-    
-    ct <- cutreeStatic(
-      sampleTree,
-      cutHeight = h,
-      minSize = 10
-    )
-    
-    tab <- table(ct)
-    
-    data.frame(
-      Cutoff = h,
-      Total_samples = length(ct),
-      Main_cluster = sum(ct == 1),
-      Flagged_or_other = sum(ct != 1),
-      Number_of_clusters = length(tab),
-      Cluster_sizes = paste(
-        names(tab), as.integer(tab),
-        sep = ":",
-        collapse = "; "
-      )
-    )
-  })
+cran_pkgs <- c(
+  "remotes", "devtools", "ggplot2", "dplyr", "tidyr", "tibble", "stringr",
+  "ggrepel", "reshape2", "corrplot", "pheatmap", "gridExtra", "RColorBrewer",
+  "viridis", "patchwork", "igraph", "ggforce", "ggpubr", "linkET",
+  "glmnet", "randomForest", "caret", "pROC",
+  "Seurat", "harmony", "Matrix"
+)
+bioc_pkgs <- c(
+  "WGCNA", "impute", "preprocessCore", "GO.db", "AnnotationDbi",
+  "clusterProfiler", "org.Hs.eg.db", "enrichplot", "ReactomePA",
+  "GEOquery", "limma", "SingleR", "celldex",
+  # monocle3 dependencies
+  "BiocGenerics", "DelayedArray", "DelayedMatrixStats", "lme4", "S4Vectors",
+  "SingleCellExperiment", "SummarizedExperiment", "batchelor", "HDF5Array",
+  "ggrastr", "terra"
 )
 
-print(cutoff_results, row.names = FALSE)
+need_cran <- setdiff(cran_pkgs, rownames(installed.packages()))
+if (length(need_cran)) install.packages(need_cran)
 
-# Inspect cluster assignments at each cutoff
-for (h in candidate_heights) {
-  ct <- cutreeStatic(
-    sampleTree,
-    cutHeight = h,
-    minSize = 10
-  )
-  
-  cat("\nCutoff:", h, "\n")
-  print(table(ct))
-  
-  # Names of samples not assigned to the main cluster
-  cat("Samples outside cluster 1:\n")
-  print(rownames(expr_t)[ct != 1])
+need_bioc <- setdiff(bioc_pkgs, rownames(installed.packages()))
+if (length(need_bioc)) BiocManager::install(need_bioc, ask = FALSE, update = FALSE)
+
+# GitHub packages
+gh <- function(pkg, repo, ...) {
+  if (!requireNamespace(pkg, quietly = TRUE)) remotes::install_github(repo, ...)
 }
-# Remove outliers above cut height
-cutHeight <- 310
-clust <- cutreeStatic(sampleTree, cutHeight = cutHeight, minSize = 10)
-keepSamples <- (clust == 1)
-expr_clean <- expr_t[keepSamples, ]
-cat("Samples remaining:", nrow(expr_clean))  # → 418
-# Keep genes expressed in ≥50% of samples
-keep_genes <- rowSums(expr_data > 0) >= (0.5 * ncol(expr_data))
-expr_filtered <- expr_data[keep_genes, ]
+gh("monocle3",        "cole-trapnell-lab/monocle3")
+gh("SeuratWrappers",  "satijalab/seurat-wrappers")
+gh("presto",          "immunogenomics/presto")        # fast Wilcoxon for FindAllMarkers
+gh("MCPcounter",      "ebecht/MCPcounter", subdir = "Source")
 
-# gene connectivity WITHOUT building the full gene x gene matrix (RAM-safe)
+# ---- check everything loads -------------------------------------------------
+all_pkgs <- c(cran_pkgs, bioc_pkgs, "monocle3", "SeuratWrappers", "presto", "MCPcounter")
+ok <- vapply(all_pkgs, requireNamespace, logical(1), quietly = TRUE)
+if (all(ok)) {
+  cat("\nAll packages installed.\n")
+} else {
+  cat("\nSTILL MISSING (install these by hand):\n"); print(names(ok)[!ok])
+}
 # =============================================================================
-# Fig1A_scale_free_power5.R
-# Fig 1A: histogram of connectivity k + scale-free topology check, power = 5
-# Saves to D:/Bioinfo/figures
+# 01_download_data.R
+#   TCGA-LIHC bulk RNA-seq + clinical (UCSC Xena)   -> training data
+#   GSE77509   (GEO)                                -> validation data
+#   GSE299340  (GEO, 10x single-cell, RAW.tar)      -> scRNA-seq
 # =============================================================================
 source("D:/Bioinfo/scripts/config.R")
-library(WGCNA)
+library(GEOquery)
 
-soft_power <- 5                                   # power used for this figure
+# ---- 1. TCGA-LIHC expression (RSEM, log2(x+1), ~21 MB) ----------------------
+expr_url <- "https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.LIHC.sampleMap%2FHiSeqV2.gz"
+expr_gz  <- P("data/raw", "TCGA_LIHC_HiSeqV2.gz")
+if (!file.exists(expr_gz)) download.file(expr_url, expr_gz, mode = "wb")
 
-# use expr_clean from the current session, otherwise load it from disk
-if (!exists("expr_clean")) load(P("rds", "LIHC_WGCNA_results.RData"))
-cat("expr_clean:", nrow(expr_clean), "samples x", ncol(expr_clean), "genes\n")
+expr_data <- read.table(gzfile(expr_gz), header = TRUE, sep = "\t",
+                        row.names = 1, quote = "", comment.char = "")
+cat("TCGA-LIHC expression:", nrow(expr_data), "genes x", ncol(expr_data), "samples\n")
+# sample names use dots, e.g. TCGA.FV.A495.01 (characters 14-15 = sample type)
+saveRDS(expr_data, P("rds", "TCGA_LIHC_expr.rds"))
 
-# ---- connectivity from the full adjacency matrix (~2.3 GB) -------------------
-adj <- adjacency(expr_clean, power = soft_power, type = "unsigned")
-k   <- rowSums(adj) - 1                          # connectivity, excluding self
-rm(adj); gc()
-cat("power", soft_power, "| mean k =", round(mean(k), 2),
-    "| median k =", round(median(k), 2), "| max k =", round(max(k), 1), "\n")
+# ---- 2. TCGA-LIHC clinical --------------------------------------------------
+clin_url <- "https://tcga-xena-hub.s3.us-east-1.amazonaws.com/download/TCGA.LIHC.sampleMap%2FLIHC_clinicalMatrix"
+clin_f   <- P("data/raw", "TCGA_LIHC_clinicalMatrix.tsv")
+if (!file.exists(clin_f)) download.file(clin_url, clin_f, mode = "wb")
 
-# ---- scale-free fit statistics (printed so you can quote them) --------------
-print(scaleFreeFitIndex(k, nBreaks = 10))
+clinical_data <- read.delim(clin_f, header = TRUE, sep = "\t",
+                            check.names = FALSE, quote = "")
+rownames(clinical_data) <- gsub("-", ".", clinical_data$sampleID)
+cat("Clinical table:", nrow(clinical_data), "rows x", ncol(clinical_data), "cols\n")
+saveRDS(clinical_data, P("rds", "TCGA_LIHC_clinical.rds"))
 
-# ---- figure 1 A-----------------------------------------------------------------
-draw_fig <- function() {
-  par(mfrow = c(1, 2), mar = c(5, 5, 4, 2))
-  hist(k, breaks = 30, main = "Histogram of k", xlab = "k", ylab = "Frequency",
-       col = "lightgray", border = "gray40", cex.main = 1.3, cex.lab = 1.2)
-  scaleFreePlot(k, main = paste0("Check scale free topology (power ", soft_power, ")\n"),
-                no.breaks = 10, cex.main = 1.3, cex.lab = 1.2)
+# ---- 3. GSE77509 (validation) ----------------------------------------------
+gse77509 <- getGEO("GSE77509", GSEMatrix = TRUE, getGPL = TRUE,
+                   destdir = P("data/raw"))[[1]]
+cat("GSE77509:", nrow(exprs(gse77509)), "features x", ncol(exprs(gse77509)), "samples\n")
+if (nrow(exprs(gse77509)) == 0) {
+  message("GSE77509 series matrix has no expression values. Downloading supplementary files instead.")
+  getGEOSuppFiles("GSE77509", makeDirectory = TRUE, baseDir = P("data/raw"))
+  message("Open D:/Bioinfo/data/raw/GSE77509 and tell me the file name; 05_validation.R must read it.")
 }
+saveRDS(gse77509, P("rds", "GSE77509_eset.rds"))
 
-pdf(P("figures", "Fig1A_ScaleFree_power5.pdf"), width = 10, height = 5)
-draw_fig()
-dev.off()
-
-png(P("figures", "Fig1A_ScaleFree_power5.png"), width = 3000, height = 1500, res = 300)
-draw_fig()
-dev.off()
-
-draw_fig()                                       # also show it in RStudio
-cat("Saved to", P("figures"), "\n")
-
-
-# Transpose for WGCNA and remove NAs
-expr_clean <- t(na.omit(expr_filtered))
-cat("Genes retained:", ncol(expr_clean))  # → 16,909
-
-# Extract sample names from cleaned expression matrix
-expr_samples <- rownames(expr_clean)
-
-# Encode tumor status from TCGA sample code (01 = Tumor, 11 = Normal)
-sample_types <- substr(expr_samples, 14, 15)
-#Takes characters 14–15 from each TCGA sample ID.
-traitData <- data.frame(
-  Normal = as.numeric(sample_types == "11"),
-  Tumor  = as.numeric(sample_types == "01"),
-  row.names = expr_samples
-)
-
-
-# Optionally add tumor stage and vital status if available
-traitData$TumorStage  <- as.numeric(gsub("Stage |[ABCDabcd]", "", clinical_matched$pathologic_stage))
-traitData$VitalStatus <- as.numeric(clinical_matched$vital_status == "Dead")
-
-# Verify
-cat("Trait matrix:", dim(traitData))  
-
-allowWGCNAThreads()
-
-# ---- 4. Soft threshold (Fig 1A/B) ------------------------------------------
-powers <- c(1:10, seq(12, 20, 2))
-sft <- pickSoftThreshold(expr_clean, powerVector = powers,
-                         networkType = "unsigned", verbose = 5)
-
-pdf(P("figures", "Fig1B_SoftThreshold.pdf"), width = 10, height = 5)
-par(mfrow = c(1, 2))
-plot(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
-     xlab = "Soft Threshold (power)", ylab = "Scale Free Topology Model Fit (R^2)",
-     type = "n", main = "Scale independence")
-text(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
-     labels = powers, col = "red")
-abline(h = 0.8, col = "red")
-plot(sft$fitIndices[, 1], sft$fitIndices[, 5],
-     xlab = "Soft Threshold (power)", ylab = "Mean Connectivity",
-     type = "n", main = "Mean connectivity")
-text(sft$fitIndices[, 1], sft$fitIndices[, 5], labels = powers, col = "red")
-dev.off()
-# Force WGCNA to use its own cor() function
-cor <- WGCNA::cor
-
-net <- blockwiseModules(
-  expr_clean,
-  power             = softPower,
-  networkType       = "unsigned",
-  TOMType           = "unsigned",
-  minModuleSize     = 30,
-  mergeCutHeight    = 0.25,
-  numericLabels     = TRUE,
-  pamRespectsDendro = FALSE,
-  saveTOMs          = FALSE,
-  corType           = "pearson",
-  nThreads          = 1,
-  verbose           = 3
-)
-
-
-# Restore original cor()
-cor <- stats::cor
-
-# Convert to color labels
-mergedColors <- labels2colors(net$colors)
-table(mergedColors)
-
-# Save progress immediately
-save(net, expr_clean, traitData, mergedColors,
-     file = "LIHC_WGCNA_network.RData")
-
-# Fig1B: Gene dendrogram with module colors
-plotDendroAndColors(
-  net$dendrograms[[1]],
-  mergedColors[net$blockGenes[[1]]], 
-  "Module Colors",
-  dendroLabels = FALSE, hang = 0.03,
-  addGuide = TRUE, guideHang = 0.05,
-  main = "Gene Dendrogram and Module Colors"
-)
-
-
-# ---- Network heatmap (TOM plot) of selected assigned genes -------------------
+# ---- 4. GSE299340 single-cell RAW.tar ---------------------------------------
+sc_dir  <- P("data/raw", "GSE299340")
+raw_tar <- file.path(sc_dir, "GSE299340_RAW.tar")
+if (!file.exists(raw_tar)) {
+  getGEOSuppFiles("GSE299340", makeDirectory = TRUE, baseDir = P("data/raw"),
+                  filter_regex = "RAW\\.tar$")
+}
+# If the download fails (slow connection), download GSE299340_RAW.tar in your
+# browser from the GEO page and put it in D:/Bioinfo/data/raw/GSE299340/
+stopifnot(file.exists(raw_tar))
+untar(raw_tar, exdir = file.path(sc_dir, "raw"))
+print(head(list.files(file.path(sc_dir, "raw")), 12))
+cat("\nDownloads finished.\n")
+# =============================================================================
+# 02_bulk_wgcna_immune.R
+# WGCNA on TCGA-LIHC with an IMMUNE trait (paper Fig 1)
+#
+# Key change: modules are chosen by their correlation with an immune infiltration
+# score (MCP-counter) measured WITHIN TUMOR samples, not by Tumor vs Normal.
+# (Tumor vs Normal modules are proliferation modules, which is how CDKN3/MND1
+# ended up as "hub genes".)
+#
+# The network itself (blockwiseModules) is expensive. If
+# rds/LIHC_WGCNA_network.RData already exists it is reused (set
+# rebuild_network <- TRUE to recompute it from scratch).
+# Output: rds/LIHC_WGCNA_results.RData, results/HCC_coexpressed_genes.csv
+# =============================================================================
+.libPaths(c("D:/Bioinfo/R/library", .libPaths()))
+source("D:/Bioinfo/scripts/config.R")
 library(WGCNA)
+library(dplyr)
+library(MCPcounter)
+options(stringsAsFactors = FALSE)
+allowWGCNAThreads(nThreads = 4)
 
-n_heat     <- 1000      # total genes to plot (the paper used 400)
-per_module <- NULL      # e.g. 120 = up to 120 genes from EVERY module; NULL = random sample
+# ---- settings -----------------------------------------------------------------
+rebuild_network <- FALSE
+imm_cor_cutoff  <- 0.4    # min module correlation with ImmuneScore (tumor samples only)
+n_modules       <- 2      # how many immune modules to keep (strongest first)
+gs_cut          <- 0.3    # keep module genes with |GS for ImmuneScore| >= gs_cut
+n_heat          <- 400    # genes in the network heatmap
+
+expr_data <- readRDS(P("rds", "TCGA_LIHC_expr.rds"))          # genes x samples (log2 RSEM+1)
+
+# ---- 1. immune scores for every sample (MCP-counter) -------------------------------
+mcp   <- MCPcounter.estimate(as.matrix(expr_data), featuresType = "HUGO_symbols")
+mcp_t <- as.data.frame(t(mcp), check.names = FALSE)           # samples x cell populations
+immune_cols <- colnames(mcp_t)[!grepl("endothelial|fibroblast", colnames(mcp_t), ignore.case = TRUE)]
+cat("Immune populations in the composite score:", paste(immune_cols, collapse = ", "), "\n")
+immune_z <- rowMeans(scale(mcp_t[, immune_cols, drop = FALSE]))   # composite ImmuneScore
+write.csv(data.frame(Sample = rownames(mcp_t), ImmuneScore = immune_z, mcp_t, check.names = FALSE),
+          P("results", "immune_scores_MCPcounter.csv"), row.names = FALSE)
+
+# ---- 2. network: reuse or build ------------------------------------------------------
+net_file <- P("rds", "LIHC_WGCNA_network.RData")
+if (file.exists(net_file) && !rebuild_network) {
+  load(net_file)       # net, expr_clean, traitData, mergedColors, soft_power (clinical_matched if saved)
+  cat("Loaded existing network:", nrow(expr_clean), "samples x", ncol(expr_clean), "genes\n")
+} else {
+  expr_t <- t(expr_data)                                      # samples x genes
+  expr_t <- expr_t[, colMeans(expr_t > 0) >= 0.5]             # genes expressed in >= 50% of samples
+  gsg <- goodSamplesGenes(expr_t, verbose = 3)
+  if (!gsg$allOK) expr_t <- expr_t[gsg$goodSamples, gsg$goodGenes]
+
+  sampleTree <- hclust(dist(expr_t), method = "average")
+  clust <- cutreeStatic(sampleTree, cutHeight = cut_height, minSize = 10)
+  type_code <- substr(rownames(expr_t), 14, 15)
+  bar_colors <- cbind(Status = ifelse(clust == 1, "grey85", "black"),
+                      Type = ifelse(type_code == "11", "#3498DB", ifelse(type_code == "01", "#E74C3C", "grey60")))
+  pdf(P("figures", "Fig_SampleClustering.pdf"), width = 16, height = 7)
+  plotDendroAndColors(sampleTree, bar_colors, groupLabels = c("Kept / removed", "Normal / Tumor"),
+                      dendroLabels = FALSE, hang = 0.03, addGuide = TRUE, guideHang = 0.05,
+                      abHeight = cut_height, abCol = "red",
+                      main = paste0("Sample clustering (cut height = ", cut_height, ")"))
+  dev.off()
+  cat("Removed samples:", sum(clust != 1), "\n")
+  expr_clean <- expr_t[clust == 1, ]
+
+  sample_code <- substr(rownames(expr_clean), 14, 15)
+  traitData <- data.frame(Normal = as.numeric(sample_code == "11"),
+                          Tumor  = as.numeric(sample_code == "01"),
+                          row.names = rownames(expr_clean))
+  print(colSums(traitData))
+
+  # soft threshold (Fig 1B)
+  powers <- c(1:10, seq(12, 20, 2))
+  sft <- pickSoftThreshold(expr_clean, powerVector = powers, networkType = "unsigned", verbose = 5)
+  pdf(P("figures", "Fig1B_SoftThreshold.pdf"), width = 10, height = 5)
+  par(mfrow = c(1, 2))
+  plot(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2], type = "n",
+       xlab = "Soft Threshold (power)", ylab = "Scale Free Topology Model Fit (R^2)", main = "Scale independence")
+  text(sft$fitIndices[, 1], -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2], labels = powers, col = "red")
+  abline(h = 0.8, col = "red")
+  plot(sft$fitIndices[, 1], sft$fitIndices[, 5], type = "n",
+       xlab = "Soft Threshold (power)", ylab = "Mean Connectivity", main = "Mean connectivity")
+  text(sft$fitIndices[, 1], sft$fitIndices[, 5], labels = powers, col = "red")
+  dev.off()
+
+  # scale-free check at the chosen power (Fig 1A), RAM-safe
+  k <- softConnectivity(expr_clean, power = soft_power, type = "unsigned")
+  pdf(P("figures", "Fig1A_ScaleFree.pdf"), width = 10, height = 5)
+  par(mfrow = c(1, 2), mar = c(5, 5, 4, 2))
+  hist(k, breaks = 30, main = "Histogram of k", xlab = "k", col = "lightgray", border = "gray40")
+  scaleFreePlot(k, main = paste0("Check scale free topology (power ", soft_power, ")\n"), no.breaks = 10)
+  dev.off()
+
+  cat("Building network (10-40 min)...\n")
+  net <- blockwiseModules(expr_clean, power = soft_power, networkType = "unsigned", TOMType = "unsigned",
+                          maxBlockSize = max_block_size, minModuleSize = min_module_size,
+                          mergeCutHeight = merge_cut, numericLabels = TRUE, pamRespectsDendro = FALSE,
+                          saveTOMs = TRUE, saveTOMFileBase = P("rds", "LIHC_TOM"), verbose = 3)
+  mergedColors <- labels2colors(net$colors)
+  names(mergedColors) <- colnames(expr_clean)
+  save(net, expr_clean, traitData, mergedColors, soft_power, file = net_file)
+}
+names(mergedColors) <- colnames(expr_clean)
+print(table(mergedColors))
+
+# ---- 3. dendrogram (Fig 1C) and network heatmap -----------------------------------
+pdf(P("figures", "Fig1C_Dendrogram.pdf"), width = 12, height = 6)
+for (b in seq_along(net$dendrograms))
+  plotDendroAndColors(net$dendrograms[[b]], mergedColors[net$blockGenes[[b]]], "Module colors",
+                      dendroLabels = FALSE, hang = 0.03, addGuide = TRUE, guideHang = 0.05,
+                      main = paste("Gene dendrogram and module colors - block", b))
+dev.off()
 
 set.seed(SEED)
-assigned <- which(mergedColors != "grey")
-
-if (is.null(per_module)) {
-  sel <- sample(assigned, min(n_heat, length(assigned)))
-} else {
-  sel <- unlist(lapply(setdiff(unique(mergedColors), "grey"), function(mc) {
-    g <- which(mergedColors == mc)
-    sample(g, min(per_module, length(g)))
-  }))
-}
-cat("Genes in heatmap:", length(sel), "\n")
-
-# TOM recomputed from the selected genes only
-adj_sel  <- adjacency(expr_clean[, sel], power = soft_power, type = "unsigned")
+sel_h    <- sample(which(mergedColors != "grey"), min(n_heat, sum(mergedColors != "grey")))
+adj_sel  <- adjacency(expr_clean[, sel_h], power = soft_power, type = "unsigned")
 diss_sel <- 1 - TOMsimilarity(adj_sel)
 tree_sel <- hclust(as.dist(diss_sel), method = "average")
-
 pdf(P("figures", "Fig1C_NetworkHeatmap.pdf"), width = 8, height = 8)
-TOMplot(diss_sel^soft_power, tree_sel, Colors = mergedColors[sel],
-        main = paste0("Network heatmap plot, ", length(sel), " selected genes"))
+TOMplot(diss_sel^soft_power, tree_sel, Colors = mergedColors[sel_h],
+        main = paste0("Network heatmap plot, ", length(sel_h), " selected genes"))
 dev.off()
-
 rm(adj_sel, diss_sel, tree_sel); gc()
 
-> # ---- 7. Module-trait relationships (Fig 1D) --------------------------------
-> MEs <- orderMEs(moduleEigengenes(expr_clean, mergedColors)$eigengenes)
-> MEs <- MEs[, colnames(MEs) != "MEgrey"]
-> moduleTraitCor  <- cor(MEs, traitData, use = "p")
-> moduleTraitPval <- corPvalueStudent(moduleTraitCor, nrow(expr_clean))
-> textMatrix <- matrix(paste0(signif(moduleTraitCor, 2), "\n(",
-                             signif(moduleTraitPval, 1), ")"),
-                      nrow = nrow(moduleTraitCor))
-> pdf(P("figures", "Fig1D_ModuleTraitHeatmap.pdf"), width = 6, height = 10)
-> par(mar = c(6, 9, 3, 3))
-> labeledHeatmap(Matrix = moduleTraitCor, xLabels = colnames(traitData),
-                yLabels = names(MEs), ySymbols = gsub("^ME", "", names(MEs)),
-                colorLabels = FALSE,
-                colors = colorRampPalette(c("navy", "white", "firebrick3"))(75),
-                textMatrix = textMatrix, setStdMargins = FALSE,
-                cex.text = 0.5, zlim = c(-1, 1),
-                main = "Module-Trait Relationships (HCC, TCGA-LIHC)")
-> dev.off()
+# ---- 4. module-trait relationships: Tumor (all samples) + immune (tumor only) -----------
+sam <- rownames(expr_clean)
+stopifnot(all(sam %in% rownames(mcp_t)))
+traits_imm <- data.frame(ImmuneScore = immune_z[sam], mcp_t[sam, immune_cols, drop = FALSE],
+                         check.names = FALSE)
+tum <- traitData$Tumor == 1
+cat("Tumor samples:", sum(tum), "| other:", sum(!tum), "\n")
 
-> sig_mask <- abs(moduleTraitCor[, "Tumor"]) > sig_cor_cutoff &
-+   moduleTraitPval[, "Tumor"] < 0.05
-> sig_module_colors <- gsub("^ME", "", rownames(moduleTraitCor)[sig_mask])
-> cat("Significant modules:", paste(sig_module_colors, collapse = ", "), "\n")
+MEs <- orderMEs(moduleEigengenes(expr_clean, mergedColors)$eigengenes)
+MEs <- MEs[, colnames(MEs) != "MEgrey", drop = FALSE]
 
+cor_T <- cor(MEs, traitData$Tumor, use = "p");               p_T <- corPvalueStudent(cor_T, nrow(expr_clean))
+cor_I <- cor(as.matrix(MEs[tum, ]), as.matrix(traits_imm[tum, ]), use = "p")
+p_I   <- corPvalueStudent(cor_I, sum(tum))
 
-# Calculate module eigengenes (exclude grey)
-MEs0 <- moduleEigengenes(expr_clean, mergedColors)$eigengenes
-MEs  <- orderMEs(MEs0)
-MEs  <- MEs[, !grepl("grey", colnames(MEs))]
-# Trait matrix: Normal vs Tumor columns
-sample_types   <- substr(rownames(expr_clean), 14, 15)
-traitData_new  <- data.frame(
-  Normal = as.numeric(sample_types == "11"),
-  Tumor  = as.numeric(sample_types == "01"),
-  row.names = rownames(expr_clean)
-)
+hm_cor <- cbind("Tumor vs Normal" = cor_T[, 1], cor_I)
+hm_p   <- cbind(p_T[, 1], p_I)
+ord <- order(hm_cor[, "ImmuneScore"], decreasing = TRUE)
+hm_cor <- hm_cor[ord, , drop = FALSE]; hm_p <- hm_p[ord, , drop = FALSE]
+txt <- matrix(paste0(signif(hm_cor, 2), "\n(", signif(hm_p, 1), ")"), nrow = nrow(hm_cor))
+pdf(P("figures", "Fig1D_ModuleTrait_immune.pdf"), width = 3 + 1.1 * ncol(hm_cor),
+    height = max(4, 0.5 * nrow(hm_cor) + 2.5))
+par(mar = c(8, 9, 3, 3))
+labeledHeatmap(Matrix = hm_cor, xLabels = colnames(hm_cor), yLabels = rownames(hm_cor),
+               ySymbols = sub("^ME", "", rownames(hm_cor)), colorLabels = TRUE,
+               colors = blueWhiteRed(50), textMatrix = txt, setStdMargins = FALSE,
+               cex.text = 0.55, zlim = c(-1, 1), xLabelsAngle = 45,
+               main = "Module-trait relationships (immune traits: tumor samples only)")
+dev.off()
 
-# Pearson correlation between modules and traits
-moduleTraitCor  <- cor(MEs, traitData_new, use = "p")
-moduleTraitPval <- corPvalueStudent(moduleTraitCor, nrow(expr_clean))
-# Build text matrix showing r and p-value
-textMatrix <- matrix(
-  paste0(signif(moduleTraitCor, 2), "\n(", signif(moduleTraitPval, 1), ")"),
-  nrow = nrow(moduleTraitCor)
-)
-# Plot module-trait heatmap
-labeledHeatmap(
-  Matrix     = moduleTraitCor,
-  xLabels    = c("Normal", "Tumor"),
-  yLabels    = gsub("ME", "", names(MEs)),
-  ySymbols   = gsub("ME", "", names(MEs)),
-  colorLabels = FALSE,
-  colors     = colorRampPalette(c("navy", "white", "firebrick3"))(75),
-  textMatrix = textMatrix,
-  setStdMargins = FALSE,
-  cex.text   = 0.5,
-  zlim       = c(-1, 1),
-  main       = "Module-Trait Relationships (HCC — TCGA LIHC)"
-)
-#########################################################################3
-#############SELECTING THE TOP MODULES####################################
-# ---------------------------------------------------------
-# Select significant modules positively correlated with Tumor
-# ---------------------------------------------------------
+module_tab <- data.frame(Module = sub("^ME", "", rownames(hm_cor)),
+                         N_genes = as.integer(table(mergedColors)[sub("^ME", "", rownames(hm_cor))]),
+                         Cor_Tumor = round(hm_cor[, 1], 3), P_Tumor = signif(hm_p[, 1], 3),
+                         Cor_ImmuneScore = round(hm_cor[, "ImmuneScore"], 3),
+                         P_ImmuneScore = signif(hm_p[, "ImmuneScore"], 3))
+print(module_tab)
+write.csv(module_tab, P("results", "module_trait_summary_immune.csv"), row.names = FALSE)
 
-cor_cutoff <- 0.30
-p_cutoff <- 0.05
+# ---- 5. choose immune modules --------------------------------------------------------------
+sel <- module_tab %>% filter(Cor_ImmuneScore >= imm_cor_cutoff, P_ImmuneScore < 0.05) %>%
+  arrange(desc(Cor_ImmuneScore)) %>% head(n_modules)
+if (nrow(sel) == 0)
+  stop("No module has correlation >= ", imm_cor_cutoff, " with ImmuneScore in tumors. ",
+       "Lower imm_cor_cutoff or look at module_trait_summary_immune.csv.")
+sig_module_colors <- sel$Module
+cat("Selected immune modules:", paste(sig_module_colors, collapse = ", "), "\n")
 
-# Create module summary
-module_summary <- data.frame(
-  Module = rownames(moduleTraitCor),
-  Correlation = moduleTraitCor[, "Tumor"],
-  P_value = moduleTraitPval[, "Tumor"]
-)
+# ---- 6. module membership vs gene significance for ImmuneScore (Fig 1E) ----------------------
+geneModuleMembership <- as.data.frame(cor(expr_clean[tum, ], MEs[tum, ], use = "p"))
+gs_immune <- as.numeric(cor(expr_clean[tum, ], traits_imm$ImmuneScore[tum], use = "p"))
+names(gs_immune) <- colnames(expr_clean)
+gs_tumor <- as.numeric(cor(expr_clean, traitData$Tumor, use = "p"))
+names(gs_tumor) <- colnames(expr_clean)
 
-# Remove grey module
-module_summary <- module_summary[
-  module_summary$Module != "MEgrey",
-]
-
-# Keep only positively correlated and significant modules
-positive_modules <- module_summary[
-  module_summary$Correlation > cor_cutoff &
-    module_summary$P_value < p_cutoff,
-]
-
-# Rank from strongest to weakest correlation
-positive_modules <- positive_modules[
-  order(positive_modules$Correlation, decreasing = TRUE),
-]
-
-# Select the top 2 modules
-top_modules <- head(positive_modules, 2)
-
-# Display results
-top_modules
-
-
-
-# ---- 8. Module membership vs gene significance (Fig 1E) --------------------
-sig_module_colors <- c("purple", "red")
-
-geneModuleMembership  <- as.data.frame(cor(expr_clean, MEs, use = "p"))
-geneTraitSignificance <- as.data.frame(cor(expr_clean, traitData$Tumor, use = "p"))
-colnames(geneTraitSignificance) <- "GS.Tumor"
-
-# look of the figure ---------------------------------------------------------
-dot_col   <- "red"      # "red" like the paper; NULL = colour each panel by its module colour
-dot_cex   <- 0.7        # dot size
-dot_lwd   <- 0.9        # outline thickness (makes the open circles crisp)
-mm_cut    <- 0.8        # vertical dashed line
-gs_cut    <- 0.2        # horizontal dashed line
-
-n_mod <- max(length(sig_module_colors), 1)
-pdf(P("figures", "Fig1E_MM_vs_GS.pdf"), width = 4.6 * n_mod, height = 4)
-par(mfrow = c(1, n_mod),
-    mar = c(3.6, 3.6, 3.2, 1), mgp = c(2.1, 0.6, 0), tcl = -0.3,
-    cex.axis = 0.7, cex.lab = 0.8, las = 0, lwd = 0.8)
-
+n_mod <- length(sig_module_colors)
+pdf(P("figures", "Fig1E_MM_vs_GS_immune.pdf"), width = 4.6 * n_mod, height = 4)
+par(mfrow = c(1, n_mod), mar = c(3.6, 3.6, 3.2, 1), mgp = c(2.1, 0.6, 0), tcl = -0.3, cex.axis = 0.7, cex.lab = 0.8)
 for (mc in sig_module_colors) {
   in_mod <- mergedColors == mc
-  mm <- abs(geneModuleMembership[in_mod, paste0("ME", mc)])
-  gs <- abs(geneTraitSignificance[in_mod, "GS.Tumor"])
-  ok <- complete.cases(mm, gs)
-  if (sum(ok) < 3) next
-  mm <- mm[ok]; gs <- gs[ok]
+  mm <- abs(geneModuleMembership[in_mod, paste0("ME", mc)]); gs <- abs(gs_immune[in_mod])
+  ok <- complete.cases(mm, gs); mm <- mm[ok]; gs <- gs[ok]
+  if (length(mm) < 3) next
   ct <- cor.test(mm, gs)
-  
-  plot(mm, gs, type = "n",
-       xlim = range(c(mm, mm_cut)), ylim = range(c(gs, gs_cut)),
-       xlab = "Module membership", ylab = "Gene significance",
-       main = "", bty = "o")
-  points(mm, gs, pch = 1, cex = dot_cex, lwd = dot_lwd,
-         col = if (is.null(dot_col)) mc else dot_col)
-  abline(v = mm_cut, h = gs_cut, lty = 2, lwd = 1, col = "black")
-  mtext(paste0("Tumor(", mc, ")"), side = 3, line = 1.7, font = 2, cex = 0.8)
-  mtext(paste0("cor=", round(ct$estimate, 2), ", p=", signif(ct$p.value, 2)),
-        side = 3, line = 0.6, font = 2, cex = 0.7)
+  plot(mm, gs, type = "n", xlim = range(c(mm, 0.8)), ylim = range(c(gs, gs_cut)),
+       xlab = "Module membership", ylab = "Gene significance (ImmuneScore)")
+  points(mm, gs, pch = 1, cex = 0.7, lwd = 0.9, col = "red")
+  abline(v = 0.8, h = gs_cut, lty = 2)
+  mtext(paste0("ImmuneScore(", mc, ")"), side = 3, line = 1.7, font = 2, cex = 0.8)
+  mtext(paste0("cor=", round(ct$estimate, 2), ", p=", signif(ct$p.value, 2)), side = 3, line = 0.6, font = 2, cex = 0.7)
 }
 dev.off()
 
-# ---- 9. Co-expressed genes from significant modules ------------------------
-module_genes_list <- lapply(sig_module_colors, function(mc) names(mergedColors)[mergedColors == mc])
-names(module_genes_list) <- sig_module_colors
-for (mc in sig_module_colors) cat("Module", mc, ":", length(module_genes_list[[mc]]), "genes\n")
-coexpressed_genes <- unique(unlist(module_genes_list))
+# ---- 7. co-expressed genes: module genes with |GS(ImmuneScore)| >= gs_cut -----------------------
+coexpressed_genes <- character()
+for (mc in sig_module_colors) {
+  g <- names(mergedColors)[mergedColors == mc]
+  keep <- g[!is.na(gs_immune[g]) & abs(gs_immune[g]) >= gs_cut]
+  cat("Module", mc, ":", length(g), "genes ->", length(keep), "after |GS| >=", gs_cut, "\n")
+  coexpressed_genes <- c(coexpressed_genes, keep)
+}
+coexpressed_genes <- unique(coexpressed_genes)
 cat("Total co-expressed genes:", length(coexpressed_genes), "\n")
+if (length(coexpressed_genes) < 50) warning("Fewer than 50 genes: consider lowering gs_cut.")
 
-gs_tumor <- setNames(geneTraitSignificance$GS.Tumor, rownames(geneTraitSignificance))
-write.csv(data.frame(Gene = coexpressed_genes,
-                     Module = mergedColors[coexpressed_genes],
-                     GS_Tumor = gs_tumor[coexpressed_genes]),
+mm_of <- mapply(function(g, m) geneModuleMembership[g, paste0("ME", m)],
+                coexpressed_genes, mergedColors[coexpressed_genes])
+write.csv(data.frame(Gene = coexpressed_genes, Module = mergedColors[coexpressed_genes],
+                     GS_Immune = gs_immune[coexpressed_genes], GS_Tumor = gs_tumor[coexpressed_genes],
+                     MM = as.numeric(mm_of)),
           P("results", "HCC_coexpressed_genes.csv"), row.names = FALSE)
 
-save(expr_clean, traitData, mergedColors, sig_module_colors, coexpressed_genes,
-     gs_tumor, MEs, moduleTraitCor, moduleTraitPval,
-     file = P("rds", "LIHC_WGCNA_results.RData"))
-cat("Done. Results in D:/Bioinfo/results and figures in D:/Bioinfo/figures\n")
-
-
-######################
-################### enrichment analysis################################
+save(expr_clean, traitData, traits_imm, immune_z, mergedColors, sig_module_colors, coexpressed_genes,
+     gs_immune, gs_tumor, MEs, soft_power, file = P("rds", "LIHC_WGCNA_results.RData"))
+cat("Done.\n")
 # =============================================================================
-# 03_enrichment.R
-# GO (BP/CC/MF), KEGG and Reactome GSEA on co-expressed genes  (paper Fig 2)
+# 03_enrichment_immune.R
+# GO (BP/CC/MF), KEGG and Reactome GSEA on the immune-module genes (paper Fig 2)
+# Sanity check: these genes should enrich for immune terms (leukocyte activation,
+# T cell activation, antigen presentation, ...). If they do not, the modules chosen
+# in script 02 are not immune modules.
 # =============================================================================
+.libPaths(c("D:/Bioinfo/R/library", .libPaths()))
 source("D:/Bioinfo/scripts/config.R")
-# 1. Install BiocManager
-if (!requireNamespace("BiocManager", quietly = TRUE)) {
-  install.packages("BiocManager")
-}
-
-# 2. Install CRAN packages
-install.packages(c(
-  "DBI",
-  "dplyr",
-  "ggplot2",
-  "igraph",
-  "ggforce",
-  "stringr"
-))
-
-# 3. Install Bioconductor packages and dependencies
-BiocManager::install(
-  c(
-    "clusterProfiler",
-    "org.Hs.eg.db",
-    "enrichplot",
-    "ReactomePA"
-  ),
-  ask = FALSE,
-  update = FALSE
-)
-# Install DBI
-install.packages("DBI", repos = "https://cloud.r-project.org")
-
-# Check whether DBI is installed
-"DBI" %in% rownames(installed.packages())
-
-# Load DBI
-library(DBI)
-.libPaths()
-find.package("DBI", quiet = TRUE)
-# Install the missing dependency
-install.packages(
-  "RSQLite",
-  repos = "https://cloud.r-project.org",
-  dependencies = TRUE
-)
-
-# Check installation
-find.package("RSQLite", quiet = TRUE)
-# Install the missing Bioconductor dependency
-if (!requireNamespace("BiocManager", quietly = TRUE)) {
-  install.packages("BiocManager")
-}
-
-BiocManager::install("GO.db", ask = FALSE, update = FALSE)
-
-# Check installation
-find.package("GO.db", quiet = TRUE)
-
-
-
-
-# Create a package library inside D:/Bioinfo
-bioinfo_lib <- "D:/Bioinfo/R/library"
-
-dir.create(
-  bioinfo_lib,
-  recursive = TRUE,
-  showWarnings = FALSE
-)
-
-# Make D:/Bioinfo/R/library the first package library
-.libPaths(c(bioinfo_lib, .libPaths()))
-
-# Check library locations
-.libPaths()
-# CRAN packages and dependencies
-install.packages(
-  c(
-    "DBI",
-    "RSQLite",
-    "dplyr",
-    "ggplot2",
-    "igraph",
-    "ggforce",
-    "stringr"
-  ),
-  lib = bioinfo_lib,
-  repos = "https://cloud.r-project.org",
-  dependencies = TRUE
-)
-
-# Ensure BiocManager is available
-if (!requireNamespace("BiocManager", quietly = TRUE)) {
-  install.packages(
-    "BiocManager",
-    lib = bioinfo_lib,
-    repos = "https://cloud.r-project.org"
-  )
-}
-
-# Bioconductor packages and their dependencies
-BiocManager::install(
-  c(
-    "clusterProfiler",
-    "org.Hs.eg.db",
-    "enrichplot",
-    "ReactomePA",
-    "GO.db"
-  ),
-  lib = bioinfo_lib,
-  ask = FALSE,
-  update = FALSE
-)
-# packages installed in D:/Bioinfo/R/library must be re-added after every restart
-.libPaths(c("D:/Bioinfo/R/library", .libPaths()))
-
-# settings (config.R is NOT sourced here, see the warning below)
-base_dir <- "D:/Bioinfo"
-P <- function(...) file.path(base_dir, ...)
-setwd(base_dir)
-SEED <- 42; set.seed(SEED)
-cut_height <- 310; min_module_size <- 30; merge_cut <- 0.25
-max_block_size <- 5000; sig_cor_cutoff <- 0.3
-
-library(WGCNA); library(dplyr); library(ggplot2)
-options(stringsAsFactors = FALSE)
-
-expr_data     <- readRDS(P("rds", "TCGA_LIHC_expr.rds"))
-clinical_data <- readRDS(P("rds", "TCGA_LIHC_clinical.rds"))
-gse77509      <- readRDS(P("rds", "GSE77509_eset.rds"))
-
-load(P("rds", "LIHC_WGCNA_network.RData"))   # net, expr_clean, traitData, clinical_matched, mergedColors, soft_power
-load(P("rds", "LIHC_WGCNA_results.RData"))   # + sig_module_colors, coexpressed_genes, gs_tumor, MEs, moduleTraitCor, moduleTraitPval
-cat("soft_power =", soft_power, "| samples:", nrow(expr_clean), "| genes:", ncol(expr_clean), "\n")
-
-.libPaths(c("D:/Bioinfo/R/library", .libPaths()))
-.libPaths()
-find.package("aisdk", quiet = TRUE)
-
-install.packages("aisdk")
-library(clusterProfiler)
-# Make sure D:/Bioinfo/R/library is first
-.libPaths(c("D:/Bioinfo/R/library", .libPaths()))
-
-# Install tidytree
-BiocManager::install(
-  "tidytree",
-  lib = "D:/Bioinfo/R/library",
-  ask = FALSE,
-  update = FALSE
-)
-
-# Check
-find.package("tidytree", quiet = TRUE)
-
-
-
-
-
-
-
-
-
-# Make D drive library the first priority
-.libPaths(c("D:/Bioinfo/R/library", .libPaths()))
-
-# Make sure BiocManager is installed
-if (!requireNamespace("BiocManager", quietly = TRUE)) {
-  install.packages(
-    "BiocManager",
-    lib = "D:/Bioinfo/R/library",
-    repos = "https://cloud.r-project.org"
-  )
-}
-
-# Install enrichplot specifically to D drive
-BiocManager::install(
-  "enrichplot",
-  lib = "D:/Bioinfo/R/library",
-  ask = FALSE,
-  update = FALSE
-)
-install.packages(
-  "ggiraph",
-  lib = "D:/Bioinfo/R/library",
-  repos = "https://cloud.r-project.org",
-  dependencies = TRUE
-)
-
-find.package("ggiraph", quiet = TRUE)
-# Check that it exists
-find.package("enrichplot", quiet = TRUE)
-.libPaths(c("D:/Bioinfo/R/library", .libPaths()))
-
-BiocManager::install(
-  "enrichplot",
-  lib = "D:/Bioinfo/R/library",
-  ask = FALSE,
-  update = FALSE
-)
-# Load it
-library(enrichplot)
-find.package("enrichplot", quiet = TRUE)
-# Set your D-drive package library
-bioinfo_lib <- "D:/Bioinfo/R/library"
-dir.create(bioinfo_lib, recursive = TRUE, showWarnings = FALSE)
-.libPaths(c(bioinfo_lib, .libPaths()))
-
-# Install BiocManager if needed
-if (!requireNamespace("BiocManager", quietly = TRUE)) {
-  install.packages(
-    "BiocManager",
-    lib = bioinfo_lib,
-    repos = "https://cloud.r-project.org"
-  )
-}
-
-# Install the required packages and their dependencies together
-BiocManager::install(
-  c(
-    "gson",
-    "clusterProfiler",
-    "enrichplot",
-    "org.Hs.eg.db",
-    "ReactomePA"
-  ),
-  lib = bioinfo_lib,
-  dependencies = TRUE,
-  ask = FALSE,
-  update = FALSE
-)
-# Try loading clusterProfiler again
-library(clusterProfiler)
-# Load the packages
-library(RSQLite)
-library(clusterProfiler)
-# 4. Test whether all packages load successfully
-library(clusterProfiler)
-library(org.Hs.eg.db)
-library(enrichplot)
-bioinfo_lib <- "D:/Bioinfo/R/library"
-.libPaths(c(bioinfo_lib, .libPaths()))
-
-install.packages(
-  "ggraph",
-  lib = bioinfo_lib,
-  repos = "https://cloud.r-project.org",
-  dependencies = TRUE
-)
-bioinfo_lib <- "D:/Bioinfo/R/library"
-.libPaths(c(bioinfo_lib, .libPaths()))
-
-BiocManager::install(
-  "reactome.db",
-  lib = bioinfo_lib,
-  ask = FALSE,
-  update = FALSE
-)
-library(ReactomePA)
-library(dplyr)
-library(ggplot2)
-library(igraph)
-library(ggforce)
-library(stringr)
-
-# 5. Confirm installation
-cat("All packages loaded successfully!\n")
 library(clusterProfiler)
 library(org.Hs.eg.db)
 library(enrichplot)
 library(ReactomePA)
-library(dplyr)
-library(ggplot2)
 library(igraph)
 library(ggforce)
 library(stringr)
+library(ggplot2)
+library(dplyr)        # loaded last so dplyr verbs are not masked by AnnotationDbi
 
-load(P("rds", "LIHC_WGCNA_results.RData"))    # coexpressed_genes, gs_tumor
+coexp <- read.csv(P("results", "HCC_coexpressed_genes.csv"))   # Gene, Module, GS_Immune, ...
+gene_ids <- bitr(coexp$Gene, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+cat("Genes mapped to Entrez:", nrow(gene_ids), "of", nrow(coexp), "\n")
 
-gene_ids <- bitr(coexpressed_genes, fromType = "SYMBOL", toType = "ENTREZID",
-                 OrgDb = org.Hs.eg.db)
-cat("Genes mapped to Entrez:", nrow(gene_ids), "of", length(coexpressed_genes), "\n")
-
-# ---- GO enrichment ----------------------------------------------------------
-run_go <- function(ont) {
-  enrichGO(gene = gene_ids$ENTREZID, OrgDb = org.Hs.eg.db, keyType = "ENTREZID",
-           ont = ont, pAdjustMethod = "BH", pvalueCutoff = 0.05,
-           qvalueCutoff = 0.05, readable = TRUE)
-}
+# ---- GO and KEGG ----------------------------------------------------------------
+run_go <- function(ont)
+  enrichGO(gene = gene_ids$ENTREZID, OrgDb = org.Hs.eg.db, keyType = "ENTREZID", ont = ont,
+           pAdjustMethod = "BH", pvalueCutoff = 0.05, qvalueCutoff = 0.05, readable = TRUE)
 go_bp <- run_go("BP"); go_cc <- run_go("CC"); go_mf <- run_go("MF")
 options(timeout = 300)
-
-kegg_enrich <- enrichKEGG(
-  gene = gene_ids$ENTREZID,
-  organism = "hsa",
-  pvalueCutoff = 0.05
-)
-kegg_enrich <- enrichKEGG(gene = gene_ids$ENTREZID, organism = "hsa", pvalueCutoff = 0.05)
+kegg_enrich <- tryCatch(enrichKEGG(gene_ids$ENTREZID, organism = "hsa", pvalueCutoff = 0.05),
+                        error = function(e) { message("KEGG failed: ", e$message); NULL })
 
 write.csv(as.data.frame(go_bp), P("results", "GO_BP_enrichment.csv"), row.names = FALSE)
 write.csv(as.data.frame(go_cc), P("results", "GO_CC_enrichment.csv"), row.names = FALSE)
 write.csv(as.data.frame(go_mf), P("results", "GO_MF_enrichment.csv"), row.names = FALSE)
-write.csv(as.data.frame(kegg_enrich), P("results", "KEGG_enrichment.csv"), row.names = FALSE)
+if (!is.null(kegg_enrich))
+  write.csv(as.data.frame(kegg_enrich), P("results", "KEGG_enrichment.csv"), row.names = FALSE)
+cat("\nTop GO BP terms (should be immune-related):\n")
+print(head(as.data.frame(go_bp)[, c("Description", "Count", "p.adjust")], 10))
 
-# ---- Network figure (Fig 2A-C) ---------------------------------------------
+# ---- network figure (Fig 2A-C) ---------------------------------------------------
 enrich_network <- function(obj, title, file, top_n = 25, sim_cut = 0.1) {
+  if (is.null(obj) || nrow(as.data.frame(obj)) < 2) { message("Too few terms: ", title); return(invisible(NULL)) }
   obj2 <- pairwise_termsim(obj)
-  res  <- obj2@result %>% filter(p.adjust < 0.05) %>% arrange(p.adjust)
+  res  <- obj2@result %>% dplyr::filter(p.adjust < 0.05) %>% dplyr::arrange(p.adjust)
   res  <- res[seq_len(min(top_n, nrow(res))), ]
   terms <- res$Description
   sim <- obj2@termsim[terms, terms]
-  sim[is.na(sim)] <- 0
-  sim[sim < sim_cut] <- 0
-  diag(sim) <- 0
+  sim[is.na(sim)] <- 0; sim[sim < sim_cut] <- 0; diag(sim) <- 0
   g <- graph_from_adjacency_matrix(sim, mode = "undirected", weighted = TRUE, diag = FALSE)
-  
+  if (ecount(g) == 0) { message("No edges above sim_cut for: ", title); return(invisible(NULL)) }
+
   set.seed(SEED)
   xy <- as.data.frame(layout_with_fr(g)); colnames(xy) <- c("x", "y"); xy$name <- V(g)$name
   nodes <- xy
   nodes$p.adjust <- res$p.adjust[match(nodes$name, res$Description)]
   nodes$size     <- res$Count[match(nodes$name, res$Description)]
   nodes$cluster  <- as.factor(membership(cluster_louvain(g)))
-  
+
   el <- as.data.frame(as_edgelist(g)); colnames(el) <- c("from", "to")
   edges <- merge(el, xy, by.x = "from", by.y = "name")
   edges <- merge(edges, xy, by.x = "to", by.y = "name", suffixes = c("_from", "_to"))
-  
-  labs_df <- nodes %>% group_by(cluster) %>% slice_min(p.adjust, n = 1, with_ties = FALSE) %>%
-    ungroup() %>% select(cluster, label = name)
-  cen <- nodes %>% group_by(cluster) %>%
-    summarise(x0 = mean(x), y0 = mean(y),
-              a = max((max(x) - min(x)) / 2 + 0.3, 0.3),
-              b = max((max(y) - min(y)) / 2 + 0.3, 0.3), .groups = "drop")
-  labs_df <- left_join(labs_df, cen, by = "cluster")
-  
+
+  labs_df <- nodes %>% dplyr::group_by(cluster) %>%
+    dplyr::slice_min(p.adjust, n = 1, with_ties = FALSE) %>% dplyr::ungroup() %>%
+    dplyr::select(cluster, label = name)
+  cen <- nodes %>% dplyr::group_by(cluster) %>%
+    dplyr::summarise(x0 = mean(x), y0 = mean(y),
+                     a = max((max(x) - min(x)) / 2 + 0.3, 0.3),
+                     b = max((max(y) - min(y)) / 2 + 0.3, 0.3), .groups = "drop")
+  labs_df <- dplyr::left_join(labs_df, cen, by = "cluster")
+
   p <- ggplot() +
     geom_ellipse(data = cen, aes(x0 = x0, y0 = y0, a = a, b = b, angle = 0),
                  fill = NA, colour = "black", linetype = "dashed", linewidth = 0.4) +
@@ -771,66 +406,40 @@ enrich_network <- function(obj, title, file, top_n = 25, sim_cut = 0.1) {
   ggsave(file, plot = p, width = 12, height = 10, dpi = 300)
   invisible(p)
 }
-library(dplyr)
-library(AnnotationDbi)
-
-select <- dplyr::select
-enrich_network
-
-
 enrich_network(go_bp, "GO Biological Process Enrichment Network", P("figures", "Fig2A_GO_BP_network.pdf"), sim_cut = 0.02)
 enrich_network(go_cc, "GO Cellular Component Enrichment Network", P("figures", "Fig2B_GO_CC_network.pdf"))
 enrich_network(go_mf, "GO Molecular Function Enrichment Network", P("figures", "Fig2C_GO_MF_network.pdf"))
 
-# ---- Reactome GSEA (Fig 2D) -------------------------------------------------
-# Rank the co-expressed genes by |gene significance for Tumor| (WGCNA), Entrez IDs
-ranked <- abs(gs_tumor[gene_ids$SYMBOL])
+# ---- Reactome GSEA (Fig 2D): genes ranked by |GS for ImmuneScore| --------------------
+ranked <- abs(coexp$GS_Immune[match(gene_ids$SYMBOL, coexp$Gene)])
 names(ranked) <- gene_ids$ENTREZID
 ranked <- sort(ranked[!is.na(ranked) & !duplicated(names(ranked))], decreasing = TRUE)
 
 set.seed(SEED)
-gsea_reactome <- gsePathway(geneList = ranked, organism = "human",
-                            minGSSize = 5, maxGSSize = 500,
-                            pvalueCutoff = 0.05, verbose = TRUE)
+gsea_reactome <- gsePathway(geneList = ranked, organism = "human", minGSSize = 5, maxGSSize = 500,
+                            pvalueCutoff = 0.05, verbose = FALSE)
 cat("Reactome pathways found:", nrow(gsea_reactome), "\n")
 write.csv(as.data.frame(gsea_reactome), P("results", "Reactome_GSEA.csv"), row.names = FALSE)
 
 if (nrow(gsea_reactome@result) >= 1) {
-  
-  top_ids <- gsea_reactome@result %>%
-    dplyr::arrange(p.adjust) %>%
-    dplyr::slice_head(n = 3) %>%
-    dplyr::pull(ID)
-  
-  p_re <- gseaplot2(
-    gsea_reactome,
-    geneSetID = top_ids,
-    title = "",
-    color = c("red", "green", "blue")[seq_along(top_ids)],
-    base_size = 11,
-    rel_heights = c(1.5, 0.5, 1),
-    pvalue_table = FALSE
-  )
-  
-  ggsave(
-    P("figures", "Fig2D_Reactome_GSEA.pdf"),
-    plot = p_re,
-    width = 10,
-    height = 7,
-    dpi = 300
-  )
+  top_ids <- gsea_reactome@result %>% dplyr::arrange(p.adjust) %>% dplyr::slice_head(n = 3) %>% dplyr::pull(ID)
+  p_re <- gseaplot2(gsea_reactome, geneSetID = top_ids, title = "",
+                    color = c("red", "green", "blue")[seq_along(top_ids)], base_size = 11,
+                    rel_heights = c(1.5, 0.5, 1), pvalue_table = FALSE)
+  ggsave(P("figures", "Fig2D_Reactome_GSEA.pdf"), plot = p_re, width = 10, height = 7, dpi = 300)
 }
 cat("Done.\n")
 # =============================================================================
-# 04_machine_learning.R
-# Lasso, Elastic Net, Ridge, Random Forest on the genes of your MAIN WGCNA
-# modules (Fig 3, 5), then validation on the GEO dataset GSE77509.
-#
-# Datasets used
-#   training / test : TCGA-LIHC (UCSC Xena)  -> expr_clean, 70/30 split
-#   validation      : GSE77509 (GEO)         -> saved by 01_download_data.R
-#   (GSE299340 is the single-cell dataset; it is used in scripts 06-09, not here)
+# 04_machine_learning_immune.R
+# Lasso / Elastic Net / Ridge / Random Forest on the IMMUNE-module genes (Fig 3, 5)
+#   training/test : TCGA-LIHC, Tumor vs Normal, 70/30 stratified split
+#   validation    : GSE77509 (script 05)
+# Changes vs. old script:
+#   * the gene pool is the immune-module gene list from script 02
+#   * class-balanced weights (TCGA has ~50 normal vs ~370 tumor samples), so the
+#     confusion matrices are not dominated by the tumor class
 # =============================================================================
+.libPaths(c("D:/Bioinfo/R/library", .libPaths()))
 source("D:/Bioinfo/scripts/config.R")
 library(glmnet)
 library(randomForest)
@@ -840,29 +449,18 @@ library(ggplot2)
 library(gridExtra)
 library(viridis)
 
-# ---- 0. Settings ------------------------------------------------------------
-main_modules <- c("purple", "red")      # <- your main (top) modules; edit if they change
-do_validation <- TRUE                   # validate on GSE77509 at the end
+# ---- 1. load WGCNA results ------------------------------------------------------
+load(P("rds", "LIHC_WGCNA_results.RData"))     # expr_clean, coexpressed_genes, sig_module_colors, ...
+main_modules <- sig_module_colors
+module_genes <- intersect(coexpressed_genes, colnames(expr_clean))
+cat("Immune modules:", paste(main_modules, collapse = ", "), "| genes:", length(module_genes), "\n")
 
-# ---- 1. Load WGCNA results and pick the genes of the main modules -----------
-if (!exists("expr_clean") || !exists("mergedColors")) {
-  load(P("rds", "LIHC_WGCNA_results.RData"))        # expr_clean, mergedColors, ...
-}
-stopifnot(identical(names(mergedColors), colnames(expr_clean)))
-
-missing_mod <- setdiff(main_modules, unique(mergedColors))
-if (length(missing_mod)) stop("Module(s) not found in mergedColors: ", paste(missing_mod, collapse = ", "))
-
-for (mc in main_modules) cat("Module", mc, ":", sum(mergedColors == mc), "genes\n")
-module_genes <- names(mergedColors)[mergedColors %in% main_modules]
-cat("Genes from main modules:", length(module_genes), "\n")
-
-# ---- 2. Feature matrix and 70/30 stratified split (TCGA-LIHC) ---------------
+# ---- 2. feature matrix and 70/30 split ----------------------------------------------
 sample_code <- substr(rownames(expr_clean), 14, 15)
-keep_s <- sample_code %in% c("01", "11")                     # tumor vs normal only
+keep_s <- sample_code %in% c("01", "11")
 X_all  <- as.matrix(expr_clean[keep_s, module_genes])
 X_all  <- X_all[, apply(X_all, 2, sd) > 0]
-y_all  <- as.numeric(sample_code[keep_s] == "01")            # Tumor = 1
+y_all  <- as.numeric(sample_code[keep_s] == "01")                # Tumor = 1
 cat("ML input:", nrow(X_all), "samples x", ncol(X_all), "genes\n")
 
 set.seed(SEED)
@@ -872,31 +470,32 @@ y_train_num <- y_all[idx];    y_test_num <- y_all[-idx]
 y_train <- factor(ifelse(y_train_num == 1, "Tumor", "Normal"), levels = c("Normal", "Tumor"))
 print(table(y_train)); print(table(y_test_num))
 
-# ---- 3. Lasso (Fig 5A) ------------------------------------------------------
+# class-balanced observation weights (each class contributes half of the total weight)
+w_train <- ifelse(y_train_num == 1, 0.5 / mean(y_train_num == 1), 0.5 / mean(y_train_num == 0))
+
+# ---- 3. Lasso (Fig 5A) ----------------------------------------------------------------
 set.seed(SEED)
-lasso_cv <- cv.glmnet(X_train_mat, y_train_num, alpha = 1, nfolds = 10,
-                      family = "binomial", type.measure = "auc")
+lasso_cv <- cv.glmnet(X_train_mat, y_train_num, alpha = 1, nfolds = 10, family = "binomial",
+                      type.measure = "auc", weights = w_train)
 lasso_coef  <- coef(lasso_cv, s = "lambda.min")
 lasso_genes <- setdiff(rownames(lasso_coef)[which(lasso_coef != 0)], "(Intercept)")
 cat("Lasso lambda.min:", lasso_cv$lambda.min, "| genes:", length(lasso_genes), "\n")
 
-n_feat <- length(lasso_genes)
-y_txt  <- mean(range(as.matrix(lasso_cv$glmnet.fit$beta)))
+y_txt <- mean(range(as.matrix(lasso_cv$glmnet.fit$beta)))
 pdf(P("figures", "Fig5A_Lasso.pdf"), width = 8, height = 6)
 par(mfrow = c(2, 1), mar = c(4, 4, 2, 1))
 plot(lasso_cv, xlab = "Log(lambda)", ylab = "AUC", main = "")
-plot(lasso_cv$glmnet.fit, xvar = "lambda", label = FALSE,
-     xlab = "Log Lambda", ylab = "Coefficients", main = "")
+plot(lasso_cv$glmnet.fit, xvar = "lambda", label = FALSE, xlab = "Log Lambda", ylab = "Coefficients", main = "")
 abline(v = log(lasso_cv$lambda.min), col = "red", lty = 2, lwd = 2)
 text(log(lasso_cv$lambda.min) + 0.05, y_txt,
-     labels = paste0("lambda=", round(lasso_cv$lambda.min, 4), "\nnb_feature=", n_feat),
+     labels = paste0("lambda=", round(lasso_cv$lambda.min, 4), "\nnb_feature=", length(lasso_genes)),
      cex = 0.8, adj = 0)
 dev.off()
 
-# ---- 4. Elastic Net (Fig 5B) ------------------------------------------------
+# ---- 4. Elastic Net (Fig 5B) ------------------------------------------------------------
 set.seed(SEED)
-enet_cv <- cv.glmnet(X_train_mat, y_train_num, alpha = 0.5, nfolds = 10,
-                     family = "binomial", type.measure = "auc")
+enet_cv <- cv.glmnet(X_train_mat, y_train_num, alpha = 0.5, nfolds = 10, family = "binomial",
+                     type.measure = "auc", weights = w_train)
 enet_coef  <- coef(enet_cv, s = "lambda.min")
 enet_genes <- setdiff(rownames(enet_coef)[which(enet_coef != 0)], "(Intercept)")
 cat("Elastic Net lambda.min:", enet_cv$lambda.min, "| genes:", length(enet_genes), "\n")
@@ -914,47 +513,46 @@ p_enet <- ggplot(enet_df, aes(Coefficient, Gene)) +
 ggsave(P("figures", "Fig5B_ElasticNet.pdf"), p_enet, width = 8,
        height = max(6, nrow(enet_df) * 0.12), dpi = 300)
 
-# ---- 5. Ridge (only for the ROC comparison in Fig 3A) -----------------------
+# ---- 5. Ridge (ROC comparison only) -----------------------------------------------------------
 set.seed(SEED)
-ridge_cv <- cv.glmnet(X_train_mat, y_train_num, alpha = 0, nfolds = 10,
-                      family = "binomial", type.measure = "auc")
+ridge_cv <- cv.glmnet(X_train_mat, y_train_num, alpha = 0, nfolds = 10, family = "binomial",
+                      type.measure = "auc", weights = w_train)
 
-# ---- 6. Random Forest (Fig 5C) ----------------------------------------------
+# ---- 6. Random Forest (Fig 5C), balanced sampling ---------------------------------------------
 cat("Random Forest running...\n")
 set.seed(SEED)
+n_min <- min(table(y_train))
 rf_model <- randomForest(x = X_train_mat, y = y_train, ntree = 500, importance = TRUE,
-                         mtry = floor(sqrt(ncol(X_train_mat))), do.trace = 50)
+                         mtry = floor(sqrt(ncol(X_train_mat))), sampsize = c(n_min, n_min),
+                         strata = y_train, do.trace = 100)
 print(rf_model)
 imp <- importance(rf_model, type = 1)
 rf_imp_df <- data.frame(Gene = rownames(imp), Importance = imp[, 1])
 rf_imp_df <- rf_imp_df[order(rf_imp_df$Importance, decreasing = TRUE), ]
-rf_genes  <- rf_imp_df$Gene[1:20]
+rf_genes  <- rf_imp_df$Gene[1:min(20, nrow(rf_imp_df))]
 
-top20 <- rf_imp_df[1:20, ]; top20$Gene <- factor(top20$Gene, levels = rev(top20$Gene))
+top20 <- rf_imp_df[seq_along(rf_genes), ]; top20$Gene <- factor(top20$Gene, levels = rev(top20$Gene))
 p_rf <- ggplot(top20, aes(Importance, Gene)) +
   geom_segment(aes(x = 0, xend = Importance, y = Gene, yend = Gene), linewidth = 0.4) +
   geom_point(colour = "#2E86C1", size = 2) +
   labs(title = "Random Forest Feature Importance", y = "") +
-  theme_bw() + theme(panel.grid = element_blank(),
-                     plot.title = element_text(hjust = 0.5, face = "bold"))
+  theme_bw() + theme(panel.grid = element_blank(), plot.title = element_text(hjust = 0.5, face = "bold"))
 ggsave(P("figures", "Fig5C_RandomForest.pdf"), p_rf, width = 5, height = 7, dpi = 300)
 
-# ---- 7. Test-set performance on TCGA hold-out (Fig 3) -----------------------
-pr <- function(m, s = "lambda.min") as.numeric(predict(m, newx = X_test_mat, s = s, type = "response"))
+# ---- 7. test-set performance (Fig 3) -------------------------------------------------------------
+pr <- function(m) as.numeric(predict(m, newx = X_test_mat, s = "lambda.min", type = "response"))
 lasso_pred_prob <- pr(lasso_cv); enet_pred_prob <- pr(enet_cv); ridge_pred_prob <- pr(ridge_cv)
 rf_pred_prob <- predict(rf_model, newdata = X_test_mat, type = "prob")[, "Tumor"]
 
-rocs <- list(
-  "Random Forest"    = roc(y_test_num, rf_pred_prob,    quiet = TRUE),
-  "Elastic Net"      = roc(y_test_num, enet_pred_prob,  quiet = TRUE),
-  "Lasso"            = roc(y_test_num, lasso_pred_prob, quiet = TRUE),
-  "Ridge Regression" = roc(y_test_num, ridge_pred_prob, quiet = TRUE))
+rocs <- list("Random Forest"    = roc(y_test_num, rf_pred_prob,    quiet = TRUE),
+             "Elastic Net"      = roc(y_test_num, enet_pred_prob,  quiet = TRUE),
+             "Lasso"            = roc(y_test_num, lasso_pred_prob, quiet = TRUE),
+             "Ridge Regression" = roc(y_test_num, ridge_pred_prob, quiet = TRUE))
 aucs <- sapply(rocs, function(r) round(as.numeric(auc(r)), 3))
 cat("TCGA test-set AUC:\n"); print(aucs)
 names(rocs) <- paste0(names(rocs), " (AUC ", aucs, ")")
 p_roc <- ggroc(rocs, legacy.axes = TRUE) + geom_abline(colour = "grey60") +
-  labs(title = "ROC (TCGA-LIHC test set)", x = "1 - Specificity", y = "Sensitivity", colour = "") +
-  theme_bw()
+  labs(title = "ROC (TCGA-LIHC test set)", x = "1 - Specificity", y = "Sensitivity", colour = "") + theme_bw()
 ggsave(P("figures", "Fig3A_ROC_4algorithms.pdf"), p_roc, width = 7, height = 5, dpi = 300)
 
 plot_cm <- function(pred_prob, true_num, title) {
@@ -975,7 +573,7 @@ cm_all <- grid.arrange(plot_cm(lasso_pred_prob, y_test_num, "Lasso"),
                        plot_cm(rf_pred_prob,    y_test_num, "Random Forest"), ncol = 3)
 ggsave(P("figures", "Fig3BCD_ConfusionMatrices.pdf"), cm_all, width = 15, height = 5, dpi = 300)
 
-# ---- 8. Feature genes and overlap -------------------------------------------
+# ---- 8. feature genes and overlap -------------------------------------------------------------------
 all_feat <- c(unique(lasso_genes), unique(enet_genes), unique(rf_genes))
 gene_counts <- as.data.frame(table(all_feat), stringsAsFactors = FALSE)
 colnames(gene_counts) <- c("Gene", "Count")
@@ -990,24 +588,28 @@ cat("Lasso:", length(lasso_genes), "| ENet:", length(enet_genes), "| RF:", lengt
 save(lasso_cv, enet_cv, ridge_cv, rf_model, lasso_genes, enet_genes, rf_genes,
      X_train_mat, X_test_mat, y_train, y_train_num, y_test_num, main_modules,
      file = P("rds", "HCC_ML_results.RData"))
-
+cat("Done.\n")
 # =============================================================================
 # 05_validation_GSE77509.R
-# Test the trained models on an independent dataset (paper Fig 4)
+# Test the trained models on the independent dataset GSE77509 (paper Fig 4)
+# Requires rds/GSE77509_matrix.rds from 05a_load_GSE77509_raw.R (unchanged).
 # =============================================================================
+.libPaths(c("D:/Bioinfo/R/library", .libPaths()))
 source("D:/Bioinfo/scripts/config.R")
+library(Biobase)
 library(GEOquery)
 library(limma)
 library(pROC)
 library(ggplot2)
 library(gridExtra)
 library(dplyr)
+library(glmnet)
+library(randomForest)
 
 load(P("rds", "HCC_ML_results.RData"))
-library(glmnet); library(randomForest)
 gse <- readRDS(P("rds", "GSE77509_eset.rds"))
 
-# labels from the RAW file names (e.g. GSM2053435_N3.sf_normalized_count.txt.gz -> N = Normal)
+# labels from RAW file names (GSM..._N3... = Normal, GSM..._T3... = Tumor)
 file_groups <- function() {
   f <- list.files(P("data/raw", "GSE77509", "raw"), pattern = "^GSM")
   tok <- sub("^GSM[0-9]+_([A-Za-z]+)[0-9]*.*$", "\\1", f)
@@ -1015,64 +617,57 @@ file_groups <- function() {
              group = ifelse(tok == "N", "Normal", ifelse(tok == "T", "Tumor", NA)))
 }
 
-expr <- exprs(gse); feat <- fData(gse); from_raw <- FALSE
-# GSE77509 is RNA-seq: the series matrix is empty, so use the matrix built by 05a_load_GSE77509_raw.R
-if (nrow(expr) == 0 && file.exists(P("rds", "GSE77509_matrix.rds"))) {
-  expr <- readRDS(P("rds", "GSE77509_matrix.rds"))          # gene symbols x GSM samples
-  gse  <- gse[, sampleNames(gse) %in% colnames(expr)]
-  expr <- expr[, sampleNames(gse), drop = FALSE]
+expr <- Biobase::exprs(gse); feat <- Biobase::fData(gse); from_raw <- FALSE
+if (nrow(expr) == 0 && file.exists(P("rds", "GSE77509_matrix.rds"))) {   # RNA-seq: matrix built by 05a
+  expr <- readRDS(P("rds", "GSE77509_matrix.rds"))
+  gse  <- gse[, Biobase::sampleNames(gse) %in% colnames(expr)]
+  expr <- expr[, Biobase::sampleNames(gse), drop = FALSE]
   from_raw <- TRUE
 }
 if (nrow(expr) == 0) stop("GSE77509 has no expression matrix: run 05a_load_GSE77509_raw.R first.")
 
-# ---- groups from sample metadata -------------------------------------------
-pd   <- pData(gse)
+# ---- groups ------------------------------------------------------------------------
+pd   <- Biobase::pData(gse)
 cols <- grep("source_name|characteristics|title", colnames(pd), value = TRUE)
 src  <- apply(pd[, cols, drop = FALSE], 1, paste, collapse = " ")
-# check "normal" terms FIRST: "non-tumor" also contains the word "tumor"
 is_normal <- grepl("non-?tumou?r|adjacent|normal|para-?cancer|para-?tumou?r|benign|control",
-                   src, ignore.case = TRUE)
+                   src, ignore.case = TRUE)           # check normal terms first: "non-tumor" contains "tumor"
 is_tumor  <- !is_normal & grepl("tumou?r|HCC|cancer|carcinoma", src, ignore.case = TRUE)
 group <- ifelse(is_tumor, "Tumor", ifelse(is_normal, "Normal", NA))
-if (anyNA(group) || length(unique(group)) < 2) {            # fall back to the file names
-  fg <- file_groups(); group <- fg$group[match(sampleNames(gse), fg$gsm)]
+if (anyNA(group) || length(unique(group)) < 2) {
+  fg <- file_groups(); group <- fg$group[match(Biobase::sampleNames(gse), fg$gsm)]
   cat("Labels taken from the RAW file names (N = Normal, T = Tumor):\n"); print(table(fg$tok))
 }
-if (anyNA(group) || length(unique(group)) < 2)
-  stop("Could not label all GSE77509 samples as Tumor/Normal; check pData(gse) and the file names.")
-outcome <- factor(group)
-print(table(outcome))
+if (anyNA(group) || length(unique(group)) < 2) stop("Could not label all GSE77509 samples as Tumor/Normal.")
+outcome <- factor(group); print(table(outcome))
 
-# ---- map probes to gene symbols --------------------------------------------
+# ---- gene symbols, scale ------------------------------------------------------------
 if (from_raw) {
-  sym <- rownames(expr)                                      # already gene symbols
+  sym <- rownames(expr)
 } else {
   sym_col <- colnames(feat)[grep("symbol", colnames(feat), ignore.case = TRUE)[1]]
-  if (is.na(sym_col)) stop("No gene-symbol column in fData(gse): ", paste(colnames(feat), collapse = ", "))
+  if (is.na(sym_col)) stop("No gene-symbol column in Biobase::fData(gse).")
   sym <- feat[[sym_col]]
 }
 ok  <- !is.na(sym) & sym != ""
 df  <- as.data.frame(expr[ok, ]); df$Gene <- sym[ok]
 agg <- df %>% group_by(Gene) %>% summarise(across(everything(), mean), .groups = "drop")
 mat <- as.matrix(agg[, -1]); rownames(mat) <- agg$Gene
-
-# ---- put on the same scale as the TCGA training data (log2) -----------------
-if (max(mat, na.rm = TRUE) > 50) mat <- log2(mat + 1)
+if (max(mat, na.rm = TRUE) > 50) mat <- log2(mat + 1)       # same log2 scale as TCGA
 mat <- normalizeBetweenArrays(mat, method = "quantile")
 
-# ---- align to training features --------------------------------------------
+# ---- align to training features -------------------------------------------------------
 feature_genes <- colnames(X_train_mat)
 common <- intersect(rownames(mat), feature_genes)
 cat("Model genes found in GSE77509:", length(common), "of", length(feature_genes), "\n")
 val <- t(mat[common, ])
 miss <- setdiff(feature_genes, common)
-if (length(miss)) {
+if (length(miss))
   val <- cbind(val, matrix(0, nrow(val), length(miss), dimnames = list(rownames(val), miss)))
-}
 val <- val[, feature_genes, drop = FALSE]
 y_val <- as.numeric(outcome == "Tumor")
 
-# ---- predictions and ROC ----------------------------------------------------
+# ---- predictions and ROC -----------------------------------------------------------------
 p_lasso <- as.numeric(predict(lasso_cv, newx = val, s = "lambda.min", type = "response"))
 p_enet  <- as.numeric(predict(enet_cv,  newx = val, s = "lambda.min", type = "response"))
 p_rf    <- predict(rf_model, newdata = val, type = "prob")[, "Tumor"]
@@ -1082,12 +677,9 @@ cat("GSE77509 AUC | Lasso:", round(auc(roc_l), 4), "| ElasticNet:", round(auc(ro
     "| RF:", round(auc(roc_r), 4), "\n")
 
 plot_roc <- function(r, title) {
-  d <- data.frame(FPR = 1 - r$specificities, TPR = r$sensitivities)
-  d <- d[order(d$FPR, d$TPR), ]
-  ggplot(d, aes(FPR, TPR)) + geom_step(colour = "#E74C3C", linewidth = 1.2) +
-    geom_abline(colour = "grey60") +
-    annotate("text", x = 0.68, y = 0.06, size = 3.5,
-             label = paste0("AUC: ", round(as.numeric(auc(r)), 3))) +
+  d <- data.frame(FPR = 1 - r$specificities, TPR = r$sensitivities); d <- d[order(d$FPR, d$TPR), ]
+  ggplot(d, aes(FPR, TPR)) + geom_step(colour = "#E74C3C", linewidth = 1.2) + geom_abline(colour = "grey60") +
+    annotate("text", x = 0.68, y = 0.06, size = 3.5, label = paste0("AUC: ", round(as.numeric(auc(r)), 3))) +
     labs(title = title, x = "1 - Specificity", y = "Sensitivity") +
     theme_bw() + theme(plot.title = element_text(hjust = 0.5, face = "bold"), panel.grid = element_blank())
 }
@@ -1100,592 +692,118 @@ write.csv(data.frame(Model = c("Lasso", "ElasticNet", "RandomForest"),
           P("results", "GSE77509_validation_AUC.csv"), row.names = FALSE)
 cat("Done.\n")
 # =============================================================================
-# 06_scRNA_preprocess_cluster.R
-# GSE299340: load -> QC -> merge -> normalise -> PCA -> Harmony -> cluster ->
-# t-SNE -> markers -> SingleR annotation  (paper Fig 6)
-# All 70k cells are used; nothing is downsampled.
-# =============================================================================
-source("D:/Bioinfo/scripts/config.R")
-library(Seurat)
-library(harmony)
-library(dplyr)
-library(ggplot2)
-library(SingleR)
-#installing celldex dependencies
-.libPaths(c("D:/Bioinfo/R/library", .libPaths()))
-BiocManager::install("celldex", ask = FALSE, update = FALSE)
-bioinfo_lib <- "D:/Bioinfo/R/library"
-dir.create(bioinfo_lib, recursive = TRUE, showWarnings = FALSE)
-.libPaths(c(bioinfo_lib, .libPaths()))
-
-install.packages(
-  "dbplyr",
-  lib = bioinfo_lib,
-  repos = "https://cloud.r-project.org",
-  dependencies = TRUE
-)
-BiocManager::install(
-  "celldex",
-  lib = bioinfo_lib,
-  ask = FALSE,
-  update = FALSE,
-  dependencies = TRUE
-)
-bioinfo_lib <- "D:/Bioinfo/R/library"
-.libPaths(c(bioinfo_lib, .libPaths()))
-
-install.packages(
-  "filelock",
-  lib = bioinfo_lib,
-  repos = "https://cloud.r-project.org",
-  dependencies = TRUE
-)
-lib <- "D:/Bioinfo/R/library"
-.libPaths(c(lib, .libPaths()))
-options(repos = BiocManager::repositories())        # CRAN + Bioconductor together
-
-# 1. every package celldex needs, recursively (Depends + Imports + LinkingTo)
-db   <- available.packages()
-deps <- tools::package_dependencies("celldex", db = db,
-                                    which = c("Depends", "Imports", "LinkingTo"),
-                                    recursive = TRUE)[[1]]
-deps <- setdiff(deps, rownames(installed.packages(priority = "base")))
-
-# 2. install whatever is missing (repeat up to 3 times in case one fails)
-for (i in 1:3) {
-  missing <- setdiff(deps, rownames(installed.packages()))
-  if (!length(missing)) break
-  cat("Round", i, "- installing:", paste(missing, collapse = ", "), "\n")
-  BiocManager::install(missing, lib = lib, ask = FALSE, update = FALSE)
-}
-print(setdiff(deps, rownames(installed.packages())))   # should print character(0)
-
-# 3. now celldex itself
-BiocManager::install("celldex", lib = lib, ask = FALSE, update = FALSE)
-library(celldex)
-
-raw_dir <- P("data/raw", "GSE299340", "raw")
-
-# ---- 1. Sample table  (VERIFY the Tumor/Normal labels on the GEO page!) -----
-sample_meta <- data.frame(
-  gsm    = paste0("GSM", 9037556:9037565),
-  sample = as.character(291:300),
-  group  = c(rep("Tumor", 5), rep("Normal", 5))
-)
-print(sample_meta)
-print(head(list.files(raw_dir)))
-
-# ---- 2. Load each sample ----------------------------------------------------
-seurat_list <- lapply(seq_len(nrow(sample_meta)), function(i) {
-  sid <- sample_meta$sample[i]; gsm <- sample_meta$gsm[i]
-  pre <- file.path(raw_dir, paste0(gsm, "_", sid, "_"))
-  mat <- ReadMtx(mtx = paste0(pre, "matrix.mtx.gz"),
-                 cells = paste0(pre, "barcodes.tsv.gz"),
-                 features = paste0(pre, "features.tsv.gz"))
-  obj <- CreateSeuratObject(counts = mat, project = sid, min.cells = 3, min.features = 200)
-  obj$sample <- sid; obj$group <- sample_meta$group[i]; obj$gsm <- gsm
-  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
-  cat("Sample", sid, "(", sample_meta$group[i], "):", ncol(obj), "cells\n")
-  obj
-})
-names(seurat_list) <- sample_meta$sample
-
-# ---- 3. QC (before / after) -------------------------------------------------
-qc_merged <- merge(seurat_list[[1]], y = seurat_list[-1], add.cell.ids = sample_meta$sample)
-p_qc <- VlnPlot(qc_merged, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
-                group.by = "sample", ncol = 3, pt.size = 0) &
-  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
-ggsave(P("figures", "QC_violin_before_filter.pdf"), p_qc, width = 14, height = 5, dpi = 300)
-rm(qc_merged, p_qc); gc()
-
-seurat_list <- lapply(seurat_list, function(o)
-  subset(o, subset = nFeature_RNA > 200 & nFeature_RNA < 6000 & percent.mt < 20))
-cat("Cells after QC:", sum(sapply(seurat_list, ncol)), "\n")
-saveRDS(seurat_list, P("rds", "GSE299340_seurat_list_postQC.rds"))
-
-# ---- 4. Merge, normalise, PCA, Harmony -------------------------------------
-combined <- merge(seurat_list[[1]], y = seurat_list[-1], add.cell.ids = sample_meta$sample)
-rm(seurat_list); gc()
-combined <- NormalizeData(combined)
-combined <- FindVariableFeatures(combined, selection.method = "vst", nfeatures = 2000)
-combined <- ScaleData(combined)
-combined <- RunPCA(combined, npcs = 30)
-combined <- RunHarmony(combined, group.by.vars = "sample", reduction.use = "pca")
-saveRDS(combined, P("rds", "GSE299340_merged_harmony.rds"))
-
-# Fig 6A: variable-feature plot
-p6a <- VariableFeaturePlot(combined)
-p6a <- LabelPoints(plot = p6a, points = head(VariableFeatures(combined), 10), repel = TRUE)
-ggsave(P("figures", "Fig6A_VariableFeatures.pdf"), p6a, width = 7, height = 5)
-
-# ---- 5. Cluster and t-SNE ---------------------------------------------------
-combined <- FindNeighbors(combined, dims = 1:20, reduction = "harmony")
-combined <- FindClusters(combined, resolution = 0.3)
-cat("Clusters:", length(unique(combined$seurat_clusters)), "\n")
-cat("Running t-SNE on all cells (this can take 30-60 min)...\n")
-combined <- RunTSNE(combined, dims = 1:20, reduction = "harmony", check_duplicates = FALSE)
-
-# join the per-sample layers so DE and annotation see all cells together
-combined <- JoinLayers(combined)
-gc()
-saveRDS(combined, P("rds", "GSE299340_clustered.rds"))
-
-p6c <- DimPlot(combined, reduction = "tsne", group.by = "seurat_clusters", label = TRUE,
-               repel = TRUE, pt.size = 0.3, raster = TRUE) + ggtitle("") +
-  labs(x = "tSNE_1", y = "tSNE_2")
-ggsave(P("figures", "Fig6C_tSNE_Clusters.pdf"), p6c, width = 8, height = 7, dpi = 300)
-
-# ---- 6. Markers on ALL cells ------------------------------------------------
-Idents(combined) <- "seurat_clusters"
-all_markers_deg <- FindAllMarkers(combined, only.pos = FALSE, min.pct = 0.25,
-                                  logfc.threshold = 0.25, test.use = "wilcox")
-markers <- all_markers_deg %>% filter(avg_log2FC > 0)
-write.csv(all_markers_deg, P("results", "GSE299340_all_markers_deg.csv"), row.names = FALSE)
-write.csv(markers,         P("results", "GSE299340_markers.csv"),         row.names = FALSE)
-cat("DE rows:", nrow(all_markers_deg), "| positive markers:", nrow(markers), "\n")
-
-# ---- 7. Cell-type annotation with SingleR (all cells, cluster level) --------
-ref <- HumanPrimaryCellAtlasData()
-expr_full <- GetAssayData(combined, assay = "RNA", layer = "data")
-
-
-# ============================================================
-# SINGLE-R CELL ANNOTATION SETUP
-# R 4.6.1 | Bioconductor 3.23
-# Install packages in D:/Bioinfo/R/library
-# ============================================================
-
-# 1. Set up the D-drive library
-bioinfo_lib <- "D:/Bioinfo/R/library"
-
-dir.create(
-  bioinfo_lib,
-  recursive = TRUE,
-  showWarnings = FALSE
-)
-
-.libPaths(c(bioinfo_lib, .libPaths()))
-
-# 2. Install BiocManager if needed
-if (!requireNamespace("BiocManager", quietly = TRUE)) {
-  install.packages(
-    "BiocManager",
-    lib = bioinfo_lib,
-    repos = "https://cloud.r-project.org"
-  )
-}
-
-# 3. Install filelock if missing
-if (!requireNamespace("filelock", quietly = TRUE)) {
-  install.packages(
-    "filelock",
-    lib = bioinfo_lib,
-    repos = "https://cloud.r-project.org"
-  )
-}
-
-# 4. Install SingleR and celldex if missing
-bioc_packages <- c(
-  "SingleR",
-  "celldex",
-  "SummarizedExperiment",
-  "SingleCellExperiment",
-  "BiocParallel",
-  "BiocGenerics",
-  "S4Vectors",
-  "IRanges",
-  "GenomicRanges"
-)
-
-missing_packages <- bioc_packages[
-  !vapply(
-    bioc_packages,
-    requireNamespace,
-    quietly = TRUE,
-    FUN.VALUE = logical(1)
-  )
-]
-
-if (length(missing_packages) > 0) {
-  BiocManager::install(
-    missing_packages,
-    lib = bioinfo_lib,
-    ask = FALSE,
-    update = FALSE,
-    dependencies = TRUE
-  )
-}
-
-# 5. Restore library paths and load packages
-.libPaths(c(bioinfo_lib, .libPaths()))
-
-library(SingleR)
-library(celldex)
-library(SummarizedExperiment)
-library(SingleCellExperiment)
-
-cat("SingleR and celldex loaded successfully!\n")
-
-# 6. Confirm that your reference object exists
-ref <- celldex::HumanPrimaryCellAtlasData()
-
-# 7. Check that the required objects exist before annotation
-stopifnot(
-  exists("expr_full"),
-  exists("combined"),
-  "seurat_clusters" %in% colnames(combined[[]])
-)
-
-# 8. Run cell annotation by cluster
-anno <- SingleR(
-  test = expr_full,
-  ref = ref,
-  labels = ref$label.main,
-  clusters = combined$seurat_clusters
-)
-
-ref <- celldex::HumanPrimaryCellAtlasData()
-bioinfo_lib <- "D:/Bioinfo/R/library"
-.libPaths(c(bioinfo_lib, .libPaths()))
-
-BiocManager::install(
-  "scrapper",
-  lib = bioinfo_lib,
-  ask = FALSE,
-  update = FALSE
-)
-
-
-
-
-anno <- SingleR(test = expr_full, ref = ref, labels = ref$label.main,
-                clusters = combined$seurat_clusters)
-cl_ids <- rownames(anno); if (is.null(cl_ids)) cl_ids <- levels(factor(combined$seurat_clusters))
-cluster_anno <- data.frame(cluster = as.character(cl_ids), cell_type = anno$labels)
-print(cluster_anno)
-write.csv(cluster_anno, P("results", "GSE299340_cluster_celltypes.csv"), row.names = FALSE)
-rm(expr_full); gc()
-
-combined$cell_type <- cluster_anno$cell_type[match(as.character(combined$seurat_clusters),
-                                                   cluster_anno$cluster)]
-print(table(combined$cell_type))
-print(table(combined$cell_type, combined$group))
-
-ord <- order(as.numeric(cluster_anno$cluster))
-combined$cluster_label <- factor(
-  paste0(combined$cell_type, " (", combined$seurat_clusters, ")"),
-  levels = paste0(cluster_anno$cell_type[ord], " (", cluster_anno$cluster[ord], ")"))
-saveRDS(combined, P("rds", "GSE299340_annotated.rds"))
-
-# ---- 8. Figures 6B, 6D, 6E --------------------------------------------------
-.libPaths(c("D:/Bioinfo/R/library", .libPaths()))
-library(dplyr)
-# ---- look of the figure (edit here) -------------------------------------------
-genes_per_cluster <- 3      # top marker genes per cluster
-size_scale <- 12            # column width ~ size_scale * sqrt(cluster size)
-min_cells  <- 100           # small clusters keep at least this many cells (or all of them)
-max_cells  <- 1500          # big clusters never get more than this
-# size_scale = 0 -> every cluster gets exactly max_cells (equal widths)
-
-# ---- 1. genes, ordered by cluster so the yellow blocks form a diagonal --------
-top_genes <- markers %>%
-  group_by(cluster) %>%
-  slice_max(avg_log2FC, n = genes_per_cluster, with_ties = FALSE) %>%
-  ungroup() %>%
-  arrange(as.numeric(as.character(cluster)), desc(avg_log2FC))
-heat_genes <- unique(top_genes$gene)
-heat_genes <- heat_genes[heat_genes %in% rownames(combined)]
-
-# ---- 2. choose cells: width grows with cluster size, but not extremely --------
-set.seed(42)
-cl_size <- table(combined$seurat_clusters)
-n_keep  <- if (size_scale == 0) pmin(cl_size, max_cells) else
-  pmin(cl_size, pmax(min_cells, pmin(max_cells, round(size_scale * sqrt(cl_size)))))
-cells_by_cl <- split(colnames(combined), combined$seurat_clusters)
-heat_cells <- unlist(lapply(names(cells_by_cl), function(k)
-  sample(cells_by_cl[[k]], n_keep[[k]])), use.names = FALSE)
-print(data.frame(cluster = names(cl_size), cells = as.integer(cl_size),
-                 shown = as.integer(n_keep[names(cl_size)])))
-
-# ---- 3. scale only the plotted genes, then draw --------------------------------
-combined <- ScaleData(combined, features = heat_genes, verbose = FALSE)
-
-n_cl <- nlevels(combined$cluster_label)
-install.packages(
-  "RColorBrewer",
-  lib = "D:/Bioinfo/R/library",
-  repos = "https://cloud.r-project.org"
-)
-library(RColorBrewer)
-grp_cols <- colorRampPalette(brewer.pal(12, "Paired"))(n_cl)
-library(Seurat)
-library(ggplot2)
-p <- DoHeatmap(combined, features = heat_genes, cells = heat_cells,
-               group.by = "cluster_label", group.colors = grp_cols,
-               label = FALSE,              # labels of tiny clusters overlap; use the legend
-               raster = TRUE, draw.lines = TRUE, lines.width = 8,
-               disp.min = -2, disp.max = 2) +
-  scale_fill_gradientn(colours = c("#3B0F70", "#8C2981", "black", "#FDE725"),
-                       limits = c(-2, 2), oob = scales::squish, name = "Scaled\nexpression") +
-  labs(title = "Top marker genes per cluster", colour = "Cluster") +
-  guides(colour = guide_legend(title = "Cluster", override.aes = list(size = 3.5))) +
-  theme(plot.title   = element_text(hjust = 0.5, face = "bold", size = 14),
-        axis.text.y  = element_text(size = 7.5, face = "italic", colour = "black"),
-        legend.title = element_text(size = 10, face = "bold"),
-        legend.text  = element_text(size = 9),
-        legend.key.size = unit(0.45, "cm"))
-
-pdf(P("figures", "Fig6B_Heatmap_improved.pdf"), width = 12, height = max(7, 0.17 * length(heat_genes) + 2))
-print(p)
-dev.off()
-cat("Saved", P("figures", "Fig6B_Heatmap_improved.pdf"), "\n")
-
-
-p6d <- DimPlot(combined, reduction = "tsne", group.by = "cell_type", label = TRUE,
-               repel = TRUE, pt.size = 0.3, raster = TRUE) + ggtitle("") +
-  labs(x = "tSNE_1", y = "tSNE_2")
-ggsave(P("figures", "Fig6D_tSNE_CellTypes.pdf"), p6d, width = 8, height = 7, dpi = 300)
-
-prop <- combined@meta.data %>% count(group, cell_type) %>% group_by(group) %>% mutate(prop = n / sum(n))
-p6e <- ggplot(prop, aes(cell_type, prop, fill = group)) +
-  geom_col(position = "dodge", width = 0.7) +
-  scale_fill_manual(values = c(Tumor = "#E74C3C", Normal = "#3498DB")) +
-  labs(x = NULL, y = "Proportion of cells", fill = "Group") + theme_bw() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid.major.x = element_blank())
-ggsave(P("figures", "Fig6E_CellProportions.pdf"), p6e, width = 10, height = 6, dpi = 300)
-write.csv(prop, P("results", "celltype_proportions.csv"), row.names = FALSE)
-cat("Done.\n")
-
-
-# =============================================================================
-# 07_hub_genes_and_DEG_enrichment.R
-# Hub genes = ML feature genes  ∩  scRNA DEGs   (paper Fig 7)
+# 07_hub_genes_immune.R
+# Hub genes = ML feature genes  ∩  IMMUNE-RESTRICTED scRNA DEGs
+#
+# Logic (differs from the old script, which used DEGs from ALL clusters):
+#   1. DEGs are taken from immune clusters only (T, NK, B, macrophage, monocyte,
+#      neutrophil) and genes that are strong markers of non-immune clusters
+#      (hepatocytes, endothelial, etc.) are removed.
+#   2. Each candidate must be directly verified as immune-enriched in the raw
+#      scRNA data (mean ratio immune/non-immune and % cells expressing).
+#   3. Candidates come from the ML pool in tiers (strict -> relaxed) so you
+#      always get a transparent, reportable gene list.
+# Input : results/GSE299340_all_markers_deg.csv, HCC_ML_gene_overlap.csv,
+#         GSE299340_cluster_celltypes.csv, HCC_coexpressed_genes.csv,
+#         rds/GSE299340_annotated.rds
+# Output: results/HCC_hub_genes.csv  (same name as before: downstream scripts work)
+#         results/hub_gene_immune_specificity.csv
 # =============================================================================
 source("D:/Bioinfo/scripts/config.R")
 library(dplyr)
-library(ggplot2)
-library(ggrepel)
-library(clusterProfiler)
-library(org.Hs.eg.db)
-library(enrichplot)
-library(ReactomePA)
+library(Seurat)
+
+# ---- settings ----------------------------------------------------------------
+immune_types   <- c("T_cells", "NK_cell", "B_cell", "Macrophage", "Monocyte", "Neutrophils")
+min_ratio      <- 1.5    # mean expression immune / non-immune
+min_pct_immune <- 5      # % of immune cells expressing the gene
+n_hub_max      <- 30     # cap on hub genes
 
 all_markers_deg <- read.csv(P("results", "GSE299340_all_markers_deg.csv"))
 gene_counts     <- read.csv(P("results", "HCC_ML_gene_overlap.csv"))
+cluster_anno    <- read.csv(P("results", "GSE299340_cluster_celltypes.csv"))
+coexp           <- read.csv(P("results", "HCC_coexpressed_genes.csv"))   # Gene, Module, GS_Immune, GS_Tumor
 
+# ---- 1. immune-restricted DEGs -----------------------------------------------
+cluster_anno$cluster <- as.character(cluster_anno$cluster)
+all_markers_deg$cluster <- as.character(all_markers_deg$cluster)
+imm_cl <- cluster_anno$cluster[cluster_anno$cell_type %in% immune_types]
+cat("Immune clusters:", paste(imm_cl, collapse = ", "), "\n")
+stopifnot(length(imm_cl) > 0)
 
+imm_up <- all_markers_deg %>%
+  filter(cluster %in% imm_cl, p_val_adj < 0.05, avg_log2FC > 0.5) %>% pull(gene) %>% unique()
+other_up <- all_markers_deg %>%
+  filter(!cluster %in% imm_cl, p_val_adj < 0.05, avg_log2FC > 1) %>% pull(gene) %>% unique()
+imm_deg <- setdiff(imm_up, other_up)
+cat("Immune up-regulated DEGs:", length(imm_up), "| after removing non-immune markers:", length(imm_deg), "\n")
 
-# ---- Hub genes --------------------------------------------------------------
-# 1. Strict scRNA-seq DEGs
-sig <- all_markers_deg %>%
-  dplyr::filter(
-    p_val_adj < 0.01,
-    avg_log2FC > 1
-  )
+# ---- 2. verify immune enrichment in the raw scRNA data -----------------------
+combined <- readRDS(P("rds", "GSE299340_annotated.rds"))
+DefaultAssay(combined) <- "RNA"
+is_imm <- combined$cell_type %in% immune_types
 
-scrna_degs <- unique(sig$gene)
+cand_all <- intersect(intersect(imm_deg, coexp$Gene), rownames(combined))
+cat("Immune DEGs inside the WGCNA modules:", length(cand_all), "\n")
+if (length(cand_all) < 3)
+  stop("Fewer than 3 immune genes inside the purple/red modules. The tumor modules contain ",
+        "almost no immune genes: lower min_ratio, or raise n_modules / lower imm_cor_cutoff in script 02 to include more modules. ",
+        "Immune modules are chosen by correlation with ImmuneScore.")
 
-# 2. Genes selected by all 3 ML models
-feat_strict <- gene_counts$Gene[gene_counts$Count == 3]
+ex <- FetchData(combined, vars = cand_all)                 # cells x genes (log-normalised)
+lin <- expm1(as.matrix(ex))
+spec <- data.frame(
+  gene          = cand_all,
+  mean_immune   = colMeans(lin[is_imm, , drop = FALSE]),
+  mean_other    = colMeans(lin[!is_imm, , drop = FALSE]),
+  pct_immune    = colMeans(lin[is_imm, , drop = FALSE] > 0) * 100,
+  pct_other     = colMeans(lin[!is_imm, , drop = FALSE] > 0) * 100)
+spec$ratio <- spec$mean_immune / (spec$mean_other + 1e-3)
+spec$immune_specific <- spec$ratio >= min_ratio & spec$pct_immune >= min_pct_immune
+spec$ML_count <- gene_counts$Count[match(spec$gene, gene_counts$Gene)]
+spec$ML_count[is.na(spec$ML_count)] <- 0
+spec$abs_GS <- abs(coexp$GS_Immune[match(spec$gene, coexp$Gene)])
+write.csv(spec[order(-spec$ratio), ], P("results", "hub_gene_immune_specificity.csv"), row.names = FALSE)
+rm(combined, ex, lin); gc()
 
-# 3. Identify final hub genes
-hub_genes <- intersect(feat_strict, scrna_degs)
-
-cat("Strict scRNA-seq DEGs:", length(scrna_degs), "\n")
-cat("Genes selected by all 3 ML models:", length(feat_strict), "\n")
-cat("Final hub genes:", length(hub_genes), "\n")
-
-print(hub_genes)
-
-# 4. Save results
-write.csv(
-  data.frame(HubGene = hub_genes),
-  P("results", "HCC_hub_genes.csv"),
-  row.names = FALSE
-)
-
-
-# =============================================================================
-# Fig7_BE_paper_style.R   - Fig 7B-E, tidy publication style
-#   7B  GO Biological Process  -> GO hierarchy graph
-#   7C  GO Cellular Component  -> GO hierarchy graph
-#   7D  GO Molecular Function  -> GO hierarchy graph
-#   7E  KEGG                   -> circular gene-pathway plot
-# Needs only: results/GSE299340_all_markers_deg.csv
-# =============================================================================
-.libPaths(c("D:/Bioinfo/R/library", .libPaths()))
-base_dir <- "D:/Bioinfo"; P <- function(...) file.path(base_dir, ...); setwd(base_dir)
-SEED <- 42; set.seed(SEED); options(timeout = 600)
-
-library(dplyr); library(ggplot2); library(ggrepel); library(RColorBrewer); library(stringr)
-library(clusterProfiler); library(org.Hs.eg.db); library(GO.db); library(igraph)
-
-# ---- look of the figures (edit here) -------------------------------------------
-n_go_terms    <- 10    # enriched GO terms per hierarchy graph
-go_wrap       <- 26    # characters per line in GO labels
-go_label_size <- 2.1   # GO label text size (smaller = neater)
-n_kegg_cats   <- 10    # KEGG pathways in the circular plot
-genes_per_cat <- 20    # genes shown per pathway (the strongest by |log2FC|)
-gene_label_sz <- 2.1   # gene label size in the circular plot
-
-# ---- DEGs (|log2FC| > 1, adj. P < 0.05, as in the paper) -----------------------
-all_markers_deg <- read.csv(P("results", "GSE299340_all_markers_deg.csv"))
-sig <- all_markers_deg %>% dplyr::filter(p_val_adj < 0.05, abs(avg_log2FC) > 1)
-gene_best <- sig %>% group_by(gene) %>% slice_max(abs(avg_log2FC), n = 1, with_ties = FALSE) %>% ungroup()
-ids <- bitr(gene_best$gene, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
-gene_best <- inner_join(gene_best, ids, by = c("gene" = "SYMBOL"))
-gene_best <- gene_best[!duplicated(gene_best$ENTREZID), ]
-entrez <- gene_best$ENTREZID
-fc_sym <- setNames(gene_best$avg_log2FC, gene_best$gene)
-cat("DEGs used:", length(entrez), "\n")
-
-# =============================================================================
-# GO hierarchy graph: enriched terms (coloured) + all their ancestors (grey)
-# =============================================================================
-go_dag_plot <- function(ego, ont, n_terms = 10, file, wrap = 26, lab_size = 2.1) {
-  res <- as.data.frame(ego); res <- head(res[order(res$p.adjust), ], n_terms)
-  par_db <- switch(ont, BP = GO.db::GOBPPARENTS, CC = GO.db::GOCCPARENTS, MF = GO.db::GOMFPARENTS)
-  
-  edges <- list(); seen <- character(); queue <- res$ID           # walk up to the root
-  while (length(queue)) {
-    cur <- queue[1]; queue <- queue[-1]
-    if (cur %in% seen) next
-    seen <- c(seen, cur)
-    pr <- tryCatch(AnnotationDbi::mget(cur, par_db, ifnotfound = NA)[[1]], error = function(e) NA)
-    if (all(is.na(pr))) next
-    pr <- pr[pr != "all"]                      # values = parent GO ids, names = relationship
-    if (!length(pr)) next
-    edges[[length(edges) + 1]] <- data.frame(child = cur, parent = as.character(pr), rel = names(pr))
-    queue <- c(queue, as.character(pr))
+# ---- 3. tiered selection ------------------------------------------------------
+tiers <- list(
+  T1_selected_by_2plus_ML = spec$ML_count >= 2,
+  T2_selected_by_any_ML   = spec$ML_count >= 1,
+  T3_module_genes_only    = rep(TRUE, nrow(spec)))
+hub <- NULL
+for (t in names(tiers)) {
+  s <- spec[tiers[[t]] & spec$immune_specific, ]
+  cat(t, ":", nrow(s), "immune-specific genes\n")
+  if (nrow(s) >= 3) {
+    s <- s[order(-s$ML_count, -s$abs_GS), ]
+    hub <- head(s, n_hub_max); hub$tier <- t
+    break
   }
-  edges <- do.call(rbind, edges)
-  edges$rel_group <- ifelse(edges$rel == "isa", "is a", ifelse(edges$rel == "part_of", "part of", "regulates"))
-  
-  node_ids <- unique(c(edges$child, edges$parent, res$ID))
-  terms <- AnnotationDbi::select(GO.db::GO.db, keys = node_ids, columns = "TERM", keytype = "GOID")
-  nodes <- data.frame(id = node_ids, term = terms$TERM[match(node_ids, terms$GOID)])
-  nodes$enriched <- nodes$id %in% res$ID
-  nodes$logp <- -log10(res$p.adjust[match(nodes$id, res$ID)])
-  nodes$lab  <- str_wrap(str_trunc(nodes$term, 70), wrap)
-  nodes$face <- ifelse(nodes$enriched, "bold", "plain")
-  
-  g <- igraph::graph_from_data_frame(data.frame(from = edges$parent, to = edges$child),
-                                     directed = TRUE, vertices = data.frame(id = nodes$id))
-  lay <- igraph::layout_with_sugiyama(g)$layout
-  nodes$x <- lay[match(nodes$id, igraph::V(g)$name), 1]
-  nodes$y <- lay[match(nodes$id, igraph::V(g)$name), 2]           # root at the top
-  
-  e2 <- edges %>%
-    left_join(nodes[, c("id", "x", "y")], by = c("parent" = "id")) %>% dplyr::rename(xp = x, yp = y) %>%
-    left_join(nodes[, c("id", "x", "y")], by = c("child"  = "id")) %>% dplyr::rename(xc = x, yc = y)
-  
-  p <- ggplot() +
-    geom_segment(data = e2, aes(x = xp, y = yp, xend = xc, yend = yc, linetype = rel_group),
-                 colour = "grey65", linewidth = 0.3,
-                 arrow = arrow(length = unit(1.1, "mm"), type = "closed")) +
-    geom_point(data = nodes[!nodes$enriched, ], aes(x, y), colour = "grey75", size = 1.4) +
-    geom_point(data = nodes[nodes$enriched, ],  aes(x, y, colour = logp), size = 3) +
-    geom_text_repel(data = nodes, aes(x, y, label = lab, fontface = face),
-                    size = lab_size, lineheight = 0.85, box.padding = 0.12, point.padding = 0.05,
-                    segment.colour = NA, min.segment.length = Inf, max.overlaps = Inf, seed = 42) +
-    scale_colour_gradient(low = "#4575B4", high = "#D73027", name = "-log10\n(adj. P)") +
-    scale_linetype_manual(values = c("is a" = "solid", "part of" = "longdash", "regulates" = "dotted"),
-                          name = "Relationship") +
-    scale_x_continuous(expand = expansion(mult = 0.06)) + scale_y_continuous(expand = expansion(mult = 0.05)) +
-    theme_void() +
-    theme(legend.title = element_text(size = 8, face = "bold"), legend.text = element_text(size = 7),
-          legend.key.size = unit(0.4, "cm"), plot.margin = margin(8, 8, 8, 8))
-  ggsave(file, p, width = 14, height = 10)
-  invisible(p)
 }
+if (is.null(hub)) stop("No tier gives >= 3 immune-specific genes. Relax min_ratio / min_pct_immune or redo script 02.")
 
-for (o in c("BP", "CC", "MF")) {
-  ego <- enrichGO(entrez, OrgDb = org.Hs.eg.db, ont = o, pvalueCutoff = 0.05, qvalueCutoff = 0.05)
-  write.csv(as.data.frame(ego), P("results", paste0("scRNA_DEG_GO_", o, ".csv")), row.names = FALSE)
-  panel <- c(BP = "Fig7B", CC = "Fig7C", MF = "Fig7D")[[o]]
-  if (nrow(as.data.frame(ego)) < 1) { message("No GO ", o, " terms"); next }
-  go_dag_plot(ego, o, n_go_terms, P("figures", paste0(panel, "_GO_", o, "_hierarchy.pdf")),
-              wrap = go_wrap, lab_size = go_label_size)
-}
-
+cat("\nTier used:", hub$tier[1], "| hub genes:", nrow(hub), "\n")
+print(hub[, c("gene", "ML_count", "ratio", "pct_immune", "pct_other", "tier")])
+write.csv(data.frame(HubGene = hub$gene, Tier = hub$tier, ML_count = hub$ML_count,
+                     ImmuneRatio = round(hub$ratio, 2)),
+          P("results", "HCC_hub_genes.csv"), row.names = FALSE)
+cat("Done.\n")
 # =============================================================================
-# Circular KEGG plot
-# =============================================================================
-circular_cnet <- function(enr, fc, n_cat = 10, per_cat = 20, file, lab_size = 2.1) {
-  res <- as.data.frame(enr)
-  res <- res[order(res$p.adjust), ][seq_len(min(n_cat, nrow(res))), ]
-  res$Description <- sub(" - Homo sapiens.*$", "", res$Description)
-  full <- setNames(strsplit(res$geneID, "/"), res$Description)
-  n_full <- lengths(full)
-  gl <- lapply(full, function(g) {                                  # strongest genes per pathway
-    v <- fc[g]; v[is.na(v)] <- 0
-    head(g[order(-abs(v))], per_cat)
-  })
-  genes <- unique(unlist(gl))
-  first_cat <- vapply(genes, function(g) which(vapply(gl, function(x) g %in% x, logical(1)))[1], integer(1))
-  fcv <- fc[genes]; fcv[is.na(fcv)] <- 0
-  genes <- genes[order(first_cat, -fcv)]; fcv <- fc[genes]; fcv[is.na(fcv)] <- 0
-  n <- length(genes)
-  
-  ang <- 2 * pi * (seq_len(n) - 0.5) / n + pi / 2
-  deg <- (ang * 180 / pi) %% 360; left <- deg > 90 & deg < 270
-  gnode <- data.frame(gene = genes, x = cos(ang), y = sin(ang), fc = fcv,
-                      lx = 1.04 * cos(ang), ly = 1.04 * sin(ang),
-                      rot = ifelse(left, deg - 180, deg), hj = ifelse(left, 1, 0))
-  k <- length(gl); t <- 2 * pi * (seq_len(k) - 1) / k
-  cat_names <- str_wrap(names(gl), 30)
-  cnode <- data.frame(category = factor(cat_names, levels = cat_names), count = as.integer(n_full),
-                      x = 0.16 * cos(t), y = 0.4 + 0.16 * sin(t))
-  edges <- do.call(rbind, lapply(seq_len(k), function(i) {
-    g <- gnode[gnode$gene %in% gl[[i]], ]
-    data.frame(category = cnode$category[i], x = cnode$x[i], y = cnode$y[i], xend = g$x, yend = g$y)
-  }))
-  pal <- setNames(colorRampPalette(brewer.pal(12, "Paired"))(k), cat_names)
-  m <- max(2, ceiling(quantile(abs(fcv), 0.95)))
-  
-  p <- ggplot() +
-    geom_segment(data = edges, aes(x = x, y = y, xend = xend, yend = yend, colour = category),
-                 linewidth = 0.3, alpha = 0.5) +
-    geom_point(data = gnode, aes(x, y, fill = fc), shape = 21, size = 1.7, stroke = 0.2, colour = "grey30") +
-    geom_point(data = cnode, aes(x, y, size = count, colour = category)) +
-    geom_text(data = gnode, aes(lx, ly, label = gene, angle = rot, hjust = hj), size = lab_size) +
-    scale_colour_manual(values = pal, name = "Pathway") +
-    scale_fill_gradient2(low = "#3B4CC0", mid = "white", high = "#E41A1C", midpoint = 0,
-                         limits = c(-m, m), oob = scales::squish, name = "log2FC") +
-    scale_size_continuous(range = c(2, 6), name = "Genes in\npathway") +
-    guides(colour = guide_legend(order = 1, override.aes = list(linewidth = 1.2, size = 2.5), ncol = 1)) +
-    coord_fixed(xlim = c(-1.45, 1.45), ylim = c(-1.4, 1.4), clip = "off") +
-    theme_void() +
-    theme(legend.title = element_text(size = 8, face = "bold"), legend.text = element_text(size = 7),
-          legend.key.size = unit(0.4, "cm"), legend.spacing.y = unit(0.15, "cm"))
-  ggsave(file, p, width = 12, height = 8)
-  invisible(p)
-}
-
-kegg <- setReadable(enrichKEGG(entrez, organism = "hsa", pvalueCutoff = 0.05),
-                    OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
-write.csv(as.data.frame(kegg), P("results", "scRNA_DEG_KEGG.csv"), row.names = FALSE)
-if (nrow(as.data.frame(kegg)) >= 1) {
-  circular_cnet(kegg, fc_sym, n_cat = n_kegg_cats, per_cat = genes_per_cat,
-                file = P("figures", "Fig7E_KEGG_circular.pdf"), lab_size = gene_label_sz)
-} else message("No significant KEGG pathways.")
-cat("Fig 7B-E done. Files are in", P("figures"), "\n")
-
-
-
-# =============================================================================
-# 08_immune_infiltration.R
-# MCP-counter + CIBERSORTx on the bulk TCGA data, hub-gene vs immune-cell
-# correlations  (paper Fig 8 and Fig 9)
+# 08_immune_infiltration_immune.R
+# MCP-counter + CIBERSORTx on bulk TCGA-LIHC; hub gene vs immune cell correlations
 #
-# CIBERSORTx is a web tool (cannot be run from R):
-#   1. run this script once: it writes  results/HCC_CIBERSORTx_input.txt
-#   2. upload that file at https://cibersortx.stanford.edu  -> module 2 'Impute Cell Fractions'
-#      (LM22 signature, relative mode, 100 permutations, batch correction disabled,
-#      quantile normalisation disabled for RNA-seq)
-#   3. download the results CSV and save it as
-#      D:/Bioinfo/results/CIBERSORTx_Job1_Results.csv
-#   4. run this script again
+# Changes vs. old script:
+#   * correlations are computed WITHIN TUMOR samples only (using Tumor+Normal
+#     together makes every tumor gene look "immune-correlated")
+#   * only immune cell scores are used for ranking (endothelial cells and
+#     fibroblasts are excluded)
+#   * Spearman tests with BH-FDR; hub genes are ranked by their strongest
+#     significant immune correlation
+#   * fan plots are drawn for the top 6 genes only
+# CIBERSORTx steps are unchanged (see comments in the old script):
+#   upload results/HCC_CIBERSORTx_input.txt at https://cibersortx.stanford.edu,
+#   save the results as results/CIBERSORTx_Job1_Results.csv, run this script again.
 # =============================================================================
 source("D:/Bioinfo/scripts/config.R")
 library(dplyr)
@@ -1695,27 +813,46 @@ library(ggpubr)
 library(linkET)
 library(MCPcounter)
 
-expr_data <- readRDS(P("rds", "TCGA_LIHC_expr.rds"))          # genes x samples (all 423)
+n_fan <- 6          # fan plots for the top genes
+fdr_cut <- 0.05
+
+expr_data <- readRDS(P("rds", "TCGA_LIHC_expr.rds"))          # genes x samples
 hub_genes <- read.csv(P("results", "HCC_hub_genes.csv"))$HubGene
 hub_present <- hub_genes[hub_genes %in% rownames(expr_data)]
 cat("Hub genes with bulk expression:", length(hub_present), "\n")
 
 group_of <- function(ids) ifelse(grepl("\\.01$", ids), "Tumor",
                                  ifelse(grepl("\\.11$", ids), "Normal", "Other"))
+tumor_ids <- colnames(expr_data)[group_of(colnames(expr_data)) == "Tumor"]
+cat("Tumor samples used for correlations:", length(tumor_ids), "\n")
+
 hub_expr <- as.data.frame(t(expr_data[hub_present, , drop = FALSE]))
 hub_expr$Mixture <- rownames(hub_expr)
 
-# CIBERSORTx input file. CIBERSORTx expects NON-log values, but TCGA HiSeqV2 is
-# log2(RSEM + 1), so convert back to linear space first.
+# CIBERSORTx input (needs linear, non-log values)
 lin <- round(2^as.matrix(expr_data) - 1, 4)
 cx  <- cbind(GeneSymbol = rownames(lin), as.data.frame(lin, check.names = FALSE))
 write.table(cx, P("results", "HCC_CIBERSORTx_input.txt"), sep = "\t", row.names = FALSE, quote = FALSE)
 rm(lin, cx); gc()
 
-# ---- helper: fan diagram of hub genes vs immune cells -----------------------
-fan_plot <- function(gene, cell_df, hub_df, file) {
-  m <- inner_join(cell_df, hub_df[, c("Mixture", gene)], by = "Mixture")
-  cells <- setdiff(colnames(cell_df), "Mixture")
+# ---- helpers ------------------------------------------------------------------
+# Spearman correlation of every hub gene with every cell score, tumor samples only
+cor_table <- function(cell_df, hub_df, cells, ids, source) {
+  m <- inner_join(cell_df[cell_df$Mixture %in% ids, c("Mixture", cells)],
+                  hub_df[hub_df$Mixture %in% ids, ], by = "Mixture")
+  cells <- cells[sapply(m[, cells, drop = FALSE], function(x) sd(x, na.rm = TRUE) > 0)]
+  genes <- setdiff(colnames(hub_df), "Mixture")
+  out <- do.call(rbind, lapply(genes, function(g) do.call(rbind, lapply(cells, function(ce) {
+    ct <- suppressWarnings(cor.test(m[[g]], m[[ce]], method = "spearman", exact = FALSE))
+    data.frame(gene = g, cell = ce, rho = unname(ct$estimate), p = ct$p.value, source = source)
+  }))))
+  out$fdr <- p.adjust(out$p, "BH")
+  out
+}
+
+fan_plot <- function(gene, cell_df, hub_df, cells, ids, file) {
+  m <- inner_join(cell_df[cell_df$Mixture %in% ids, c("Mixture", cells)],
+                  hub_df[hub_df$Mixture %in% ids, c("Mixture", gene)], by = "Mixture")
   cells <- cells[sapply(m[, cells], function(x) sd(x, na.rm = TRUE) > 0)]
   cell_cor <- correlate(m[, cells], method = "spearman")
   mt <- mantel_test(m[, gene, drop = FALSE], m[, cells], spec_select = setNames(list(1), gene)) %>%
@@ -1727,16 +864,10 @@ fan_plot <- function(gene, cell_df, hub_df, file) {
     scale_fill_gradientn(colours = c("#4575B4", "white", "#D73027"), limits = c(-1, 1), name = "Spearman's R") +
     scale_size_manual(values = c(0.4, 0.8, 1.6), name = "Mantel r") +
     scale_colour_manual(values = c("#D73027", "#FDAE61", "grey80"), name = "P-value") +
-    ggtitle(gene) + theme(plot.title = element_text(face = "bold", hjust = 0))
+    ggtitle(paste0(gene, " (tumor samples)")) + theme(plot.title = element_text(face = "bold", hjust = 0))
   ggsave(file, p, width = 9, height = 8, dpi = 300)
 }
-# helper: strongest absolute correlation of each hub gene with any immune cell
-max_cor <- function(cell_df, hub_df) {
-  m <- inner_join(cell_df, hub_df, by = "Mixture")
-  cells <- setdiff(colnames(cell_df), "Mixture")
-  sapply(setdiff(colnames(hub_df), "Mixture"), function(g)
-    max(abs(suppressWarnings(cor(m[[g]], m[, cells], method = "spearman", use = "pairwise"))), na.rm = TRUE))
-}
+
 boxplot_groups <- function(long, title, ylab, file) {
   p <- ggplot(long, aes(Cell_Type, Value, fill = group)) +
     geom_boxplot(outlier.size = 0.3, width = 0.6) +
@@ -1748,22 +879,25 @@ boxplot_groups <- function(long, title, ylab, file) {
   ggsave(file, p, width = 13, height = 6, dpi = 300)
 }
 
-# ---- MCP-counter (Fig 9) ----------------------------------------------------
+# ---- MCP-counter (Fig 9) --------------------------------------------------------
 mcp <- MCPcounter.estimate(as.matrix(expr_data), featuresType = "HUGO_symbols")
 mcp_df <- as.data.frame(t(mcp)); mcp_df$Mixture <- rownames(mcp_df)
 mcp_df <- mcp_df[, c("Mixture", setdiff(colnames(mcp_df), "Mixture"))]
 write.csv(mcp_df, P("results", "MCPcounter_scores.csv"), row.names = FALSE)
 
+mcp_cells_all <- setdiff(colnames(mcp_df), "Mixture")
+mcp_immune <- mcp_cells_all[!grepl("endothelial|fibroblast", mcp_cells_all, ignore.case = TRUE)]
+cat("MCP immune cell scores used:", paste(mcp_immune, collapse = ", "), "\n")
+
 mcp_long <- mcp_df %>% mutate(group = group_of(Mixture)) %>% filter(group != "Other") %>%
   pivot_longer(-c(Mixture, group), names_to = "Cell_Type", values_to = "Value")
 boxplot_groups(mcp_long, "Immune infiltration: Tumor vs Normal (MCP-counter)",
                "MCP-counter score", P("figures", "Fig9A_MCPcounter_boxplot.pdf"))
-for (g in hub_present) fan_plot(g, mcp_df, hub_expr, P("figures", paste0("Fig9_", g, "_MCPcounter_fan.pdf")))
-mc_mcp <- max_cor(mcp_df, hub_expr)
+tab_mcp <- cor_table(mcp_df, hub_expr, mcp_immune, tumor_ids, "MCPcounter")
 
-# ---- CIBERSORTx (Fig 8) -----------------------------------------------------
+# ---- CIBERSORTx (Fig 8) ----------------------------------------------------------
 cib_file <- P("results", "CIBERSORTx_Job1_Results.csv")
-mc_cib <- NULL
+tab_cib <- NULL; cib_df <- NULL
 if (file.exists(cib_file)) {
   cib <- read.csv(cib_file, check.names = FALSE)
   cell_cols <- setdiff(colnames(cib), c("Mixture", "P-value", "Correlation", "RMSE"))
@@ -1772,560 +906,261 @@ if (file.exists(cib_file)) {
     pivot_longer(-c(Mixture, group), names_to = "Cell_Type", values_to = "Value")
   boxplot_groups(cib_long, "Immune cell fractions: Tumor vs Normal (CIBERSORTx)",
                  "Fraction", P("figures", "Fig8A_CIBERSORT_boxplot.pdf"))
-  for (g in hub_present) fan_plot(g, cib_df, hub_expr, P("figures", paste0("Fig8_", g, "_CIBERSORT_fan.pdf")))
-  mc_cib <- max_cor(cib_df, hub_expr)
+  tab_cib <- cor_table(cib_df, hub_expr, cell_cols, tumor_ids, "CIBERSORTx")
 } else {
-  message("CIBERSORTx results not found (", cib_file, "). Fig 8 skipped; see steps at the top of this script.")
+  message("CIBERSORTx results not found (", cib_file, "). Fig 8 skipped.")
 }
 
-# ---- choose the 3 hub genes with the strongest immune correlation -----------
-score <- if (is.null(mc_cib)) mc_mcp else pmax(mc_mcp, mc_cib)
-top3 <- names(sort(score, decreasing = TRUE))[1:min(3, length(score))]
-cat("Hub genes ranked by strongest immune correlation:\n"); print(round(sort(score, decreasing = TRUE), 3))
-write.csv(data.frame(Gene = names(score), MaxAbsCor = as.numeric(score))[order(-score), ],
-          P("results", "hub_gene_immune_correlation.csv"), row.names = FALSE)
+# ---- rank hub genes by strongest SIGNIFICANT immune correlation (tumor only) ------
+cor_all <- rbind(tab_mcp, tab_cib)
+write.csv(cor_all, P("results", "hub_gene_immune_correlations_tumor_only.csv"), row.names = FALSE)
+
+score <- cor_all %>% group_by(gene) %>%
+  summarise(MaxAbsRho = max(ifelse(fdr < fdr_cut, abs(rho), 0), na.rm = TRUE),
+            BestCell  = cell[which.max(ifelse(fdr < fdr_cut, abs(rho), 0))],
+            .groups = "drop") %>%
+  arrange(desc(MaxAbsRho))
+print(as.data.frame(score))
+write.csv(score, P("results", "hub_gene_immune_correlation.csv"), row.names = FALSE)
+
+ranked <- score$gene[score$MaxAbsRho > 0]
+if (length(ranked) == 0) stop("No hub gene has a significant immune correlation within tumors (FDR < ", fdr_cut, ").")
+top3 <- head(ranked, 3)
 write.csv(data.frame(Gene = top3), P("results", "top3_hub_genes_for_scRNA.csv"), row.names = FALSE)
+
+# ---- fan plots for the strongest genes ---------------------------------------------
+for (g in head(ranked, n_fan)) {
+  fan_plot(g, mcp_df, hub_expr, mcp_immune, tumor_ids, P("figures", paste0("Fig9_", g, "_MCPcounter_fan.pdf")))
+  if (!is.null(cib_df))
+    fan_plot(g, cib_df, hub_expr, setdiff(colnames(cib_df), "Mixture"), tumor_ids,
+             P("figures", paste0("Fig8_", g, "_CIBERSORT_fan.pdf")))
+}
 cat("Top 3 hub genes for Fig 10/11:", paste(top3, collapse = ", "), "\nDone.\n")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-####################################PART 4 — MACHINE LEARNING  ###################################
-library(glmnet); library(randomForest); library(caret); library(pROC)
-
-# Subset to co-expressed genes only
-common_genes <- intersect(coexpressed_genes, colnames(expr_clean))
-expr_ml <- expr_clean[, common_genes]
-
-# Encode outcome
-sample_types <- substr(rownames(expr_clean), 14, 15)
-outcome      <- factor(ifelse(sample_types == "01", "Tumor", "Normal"),
-                       levels = c("Normal", "Tumor"))
-
-# Train/test split (70/30)
-set.seed(42)
-train_idx <- createDataPartition(outcome, p = 0.7, list = FALSE)
-X_train <- expr_ml[train_idx, ]; y_train <- outcome[train_idx]
-X_test  <- expr_ml[-train_idx, ]; y_test  <- outcome[-train_idx]
-
-# Convert to matrix + numeric for glmnet
-X_train_mat <- as.matrix(X_train)
-X_test_mat  <- as.matrix(X_test)
-y_train_num <- as.numeric(y_train) - 1
-y_test_num  <- as.numeric(y_test)  - 1
-#####################################11 · LASSO — Strict Gene Selection via L1 Penalty#################
-set.seed(42)
-
-# Run LASSO with 10-fold cross-validation
-lasso_cv <- cv.glmnet(
-  x = X_train_mat, y = y_train_num,
-  alpha = 1, nfolds = 10,
-  family = "binomial", type.measure = "auc"
-)
-
-cat("Best lambda:", lasso_cv$lambda.min)  # → 0.0172
-
-# Extract non-zero gene coefficients
-lasso_coef  <- coef(lasso_cv, s = "lambda.min")
-lasso_genes <- rownames(lasso_coef)[which(lasso_coef != 0)]
-lasso_genes <- lasso_genes[lasso_genes != "(Intercept)"]
-cat("Lasso genes selected:", length(lasso_genes))  # → 17
-
-# Plot LASSO — CV curve + coefficient paths
-pdf("Fig3A_Lasso.pdf", width = 8, height = 6)
-par(mfrow = c(2, 1), mar = c(4, 4, 2, 1))
-plot(lasso_cv, xlab = "Log(λ)", ylab = "Binomial Deviance", col = "red", main = "")
-plot(lasso_cv$glmnet.fit, xvar = "lambda", label = FALSE,
-     xlab = "Log Lambda", ylab = "Coefficients", main = "")
-abline(v = -log(lasso_cv$lambda.min), col = "red", lty = 2, lwd = 2)
-dev.off()
-
-save(lasso_cv, lasso_genes, file = "HCC_Lasso_results.RData")
-##################################12 · Elastic Net — Combined L1 + L2 Penalty##############################
-set.seed(42)
-
-# Run Elastic Net (alpha=0.5 = 50% LASSO + 50% Ridge)
-enet_cv <- cv.glmnet(
-  x = X_train_mat, y = y_train_num,
-  alpha = 0.5, nfolds = 10,
-  family = "binomial", type.measure = "auc"
-)
-
-cat("Elastic Net lambda.min:", enet_cv$lambda.min)  # → 0.0078
-
-# Extract non-zero gene coefficients
-enet_coef  <- coef(enet_cv, s = "lambda.min")
-enet_genes <- rownames(enet_coef)[which(enet_coef != 0)]
-enet_genes <- enet_genes[enet_genes != "(Intercept)"]
-cat("Elastic Net genes:", length(enet_genes))  # → 81
-
-# Plot coefficient values as dot plot
-enet_coef_df <- data.frame(
-  Gene        = enet_genes,
-  Coefficient = as.numeric(enet_coef[enet_genes, 1])
-)
-enet_coef_df <- enet_coef_df[order(enet_coef_df$Coefficient), ]
-enet_coef_df$Gene <- factor(enet_coef_df$Gene, levels = enet_coef_df$Gene)
-
-p_enet <- ggplot(enet_coef_df, aes(x = Coefficient, y = Gene)) +
-  geom_point(aes(color = Coefficient), size = 1) +
-  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
-  scale_color_gradient2(low="#4575B4", mid="grey80", high="#D73027", midpoint=0) +
-  labs(title = "Elastic Net — Influential Variables", x = "Coefficient", y = "") +
-  theme_bw() + theme(axis.text.y = element_text(size = 6))
-
-ggsave("Fig3B_ElasticNet_genes.pdf", plot = p_enet, width = 8, height = 6, dpi = 300)
-save(enet_cv, enet_genes, enet_coef_df, file = "HCC_ElasticNet_results.RData")
-#################################13 · Random Forest — Ensemble Tree Feature Importance##################
-set.seed(42)
-
-# Train Random Forest (500 trees)
-rf_model <- randomForest(
-  x         = X_train_mat,
-  y         = y_train,
-  ntree     = 500,
-  importance = TRUE,
-  mtry      = floor(sqrt(ncol(X_train_mat))),
-  verbose   = TRUE
-)
-
-# Check OOB error rate (~2% = excellent)
-cat("OOB error rate:", rf_model$err.rate[nrow(rf_model$err.rate), 1])
-
-# Extract top 20 genes by Mean Decrease Accuracy
-rf_importance <- importance(rf_model, type = 1)
-rf_imp_df     <- data.frame(Gene = rownames(rf_importance),
-                             Importance = rf_importance[, 1])
-rf_imp_df     <- rf_imp_df[order(rf_imp_df$Importance, decreasing = TRUE), ]
-rf_genes      <- rf_imp_df$Gene[1:20]
-
-# Plot lollipop chart of top 20 genes
-top20_df <- rf_imp_df[1:20, ]
-top20_df$Gene <- factor(top20_df$Gene, levels = rev(top20_df$Gene))
-
-p_rf <- ggplot(top20_df, aes(x = Importance, y = Gene)) +
-  geom_segment(aes(x=0, xend=Importance, y=Gene, yend=Gene), linewidth=0.4) +
-  geom_point(color = "#2E86C1", size = 2) +
-  labs(title = "Random Forest Feature Importance", x = "Importance", y = "") +
-  theme_bw() + theme(panel.grid = element_blank())
-
-ggsave("Fig3C_RandomForest_genes.pdf", plot = p_rf, width = 5, height = 7, dpi = 300)
-save(rf_model, rf_genes, rf_imp_df, file = "HCC_RandomForest_results.RData")
-###############################confusion matrix and ROC validation##############################
+# =============================================================================
+# 09_hubgene_scRNA_pseudotime_immune.R
+# Hub-gene expression in IMMUNE cells (Fig 10) + Monocle3 myeloid trajectory (Fig 11)
+#
+# Changes vs. old script:
+#   * Fig 10 is drawn on immune cells only (as in the paper)
+#   * a DotPlot on ALL cells shows immune vs non-immune expression
+#   * statistics: immune vs non-immune, immune cell type vs other immune cells,
+#     Tumor vs Normal within each immune cell type
+#   * trajectory = Monocyte -> Macrophage (related cells), root chosen on the
+#     principal graph, Fig 11D uses log1p + GAM + Spearman + Moran's I
+#   * Fig 11E = gene modules (as in the paper) + hub-gene heatmap
+# NOTE: untested on your data. Check sample_col and the cell_type names.
+# =============================================================================
+source("D:/Bioinfo/scripts/config.R")
+library(Seurat)
+library(SeuratWrappers)
+library(monocle3)
+library(SummarizedExperiment)
+library(Matrix)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
 library(viridis)
+library(pheatmap)
 
-# Get predicted probabilities from each model on test set
-lasso_pred_prob <- predict(lasso_cv, newx=X_test_mat, s="lambda.min", type="response")[,1]
-enet_pred_prob  <- predict(enet_cv,  newx=X_test_mat, s="lambda.min", type="response")[,1]
-rf_pred_prob    <- predict(rf_model, newdata=X_test_mat, type="prob")[, "Tumor"]
+# ---- CONFIG -----------------------------------------------------------------
+immune_types <- c("T_cells", "NK_cell", "B_cell", "Macrophage", "Monocyte", "Neutrophils")
+traj_keep    <- c("Monocyte", "Macrophage")   # cells in the trajectory
+traj_root    <- "Monocyte"                    # root population (column cell_type)
+cores        <- 2
 
-# Function to plot normalized confusion matrix
-plot_cm <- function(pred_prob, true_labels, title, filename) {
-  pred_class  <- factor(ifelse(pred_prob > 0.5, "Tumor", "Normal"), levels=c("Tumor","Normal"))
-  true_class  <- factor(ifelse(true_labels == 1, "Tumor", "Normal"), levels=c("Tumor","Normal"))
-  cm          <- confusionMatrix(pred_class, true_class)
-  cm_norm     <- cm$table / rowSums(cm$table)
-  cm_df       <- as.data.frame(cm_norm)
-  colnames(cm_df) <- c("Predicted", "Actual", "Proportion")
-  p <- ggplot(cm_df, aes(x=Predicted, y=Actual, fill=Proportion)) +
-    geom_tile(color="white", linewidth=2) +
-    geom_text(aes(label=sprintf("%.2f", Proportion)), size=12, fontface="bold", color="white") +
-    scale_fill_viridis(option="viridis", limits=c(0,1)) +
-    labs(title="Normalized confusion matrix", x="Predicted", y="True label") +
-    theme_bw()
-  ggsave(filename, plot=p, width=6, height=5, dpi=300)
-  return(p)
+grp_cols <- c(Tumor = "#E74C3C", Normal = "#3498DB")
+ct_cols  <- c(T_cells = "#1F77B4", NK_cell = "#2CA02C", B_cell = "#FF7F0E",
+              Macrophage = "#E8503A", Monocyte = "#9966CC", Neutrophils = "#8C564B")
+
+combined <- readRDS(P("rds", "GSE299340_annotated.rds"))
+DefaultAssay(combined) <- "RNA"
+combined <- tryCatch(JoinLayers(combined), error = function(e) combined)
+
+hub_all  <- read.csv(P("results", "HCC_hub_genes.csv"))$HubGene
+hub_top3 <- read.csv(P("results", "top3_hub_genes_for_scRNA.csv"))$Gene
+missing  <- setdiff(hub_top3, rownames(combined))
+if (length(missing)) cat("WARNING: not found in scRNA object:", paste(missing, collapse = ", "), "\n")
+hub_all  <- hub_all[hub_all %in% rownames(combined)]
+hub_top3 <- hub_top3[hub_top3 %in% rownames(combined)]
+cat("Top hub genes:", paste(hub_top3, collapse = ", "), "\n")
+
+combined$is_immune <- ifelse(combined$cell_type %in% immune_types, "Immune", "Non_immune")
+imm <- subset(combined, cell_type %in% immune_types)
+cat("Immune cells:", ncol(imm), "of", ncol(combined), "\n")
+print(table(imm$cell_type, imm$group))
+
+# ---- Fig 10: plots (immune cells) ---------------------------------------------
+p10a <- DimPlot(imm, reduction = "tsne", group.by = "cell_type", label = TRUE, repel = TRUE,
+                pt.size = 0.3, raster = TRUE) + ggtitle("") + labs(x = "tSNE_1", y = "tSNE_2")
+ggsave(P("figures", "Fig10A_tSNE_ImmuneCells.pdf"), p10a, width = 8, height = 7)
+
+grp <- imm@meta.data %>% dplyr::count(cell_type, group)
+p10b <- ggplot(grp, aes(cell_type, n, fill = group)) + geom_col(position = "fill") +
+  scale_fill_manual(values = grp_cols) + labs(x = NULL, y = "Proportion", fill = "Group") +
+  theme_bw() + theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid = element_blank())
+ggsave(P("figures", "Fig10B_ImmuneCell_Group.pdf"), p10b, width = 8, height = 6)
+
+p10c <- FeaturePlot(imm, features = hub_top3, reduction = "tsne", ncol = 3, pt.size = 0.2,
+                    order = TRUE, raster = TRUE) & scale_color_gradient(low = "grey90", high = "purple")
+ggsave(P("figures", "Fig10C_FeaturePlot.pdf"), p10c, width = 13, height = 4.5)
+
+p10d <- VlnPlot(imm, features = hub_top3, group.by = "cell_type", ncol = 3, pt.size = 0)
+ggsave(P("figures", "Fig10D_VlnPlot.pdf"), p10d, width = 14, height = 4.5)
+
+p10d2 <- VlnPlot(imm, features = hub_top3, group.by = "cell_type", split.by = "group",
+                 pt.size = 0, cols = grp_cols, ncol = 3)
+ggsave(P("figures", "Fig10D2_VlnPlot_byGroup.pdf"), p10d2, width = 16, height = 4.5)
+
+# immune vs non-immune on ALL cells (shows % expressing and mean level)
+p10e <- DotPlot(combined, features = hub_top3, group.by = "cell_type") + RotatedAxis() + coord_flip()
+ggsave(P("figures", "Fig10E_DotPlot_AllCells.pdf"), p10e, width = 9, height = 3 + 0.6 * length(hub_top3))
+
+# ---- Fig 10: statistics ------------------------------------------------------------
+# (1) immune vs non-immune, all cells
+Idents(combined) <- "is_immune"
+st1 <- FindMarkers(combined, ident.1 = "Immune", ident.2 = "Non_immune", features = hub_top3,
+                   test.use = "wilcox", logfc.threshold = 0, min.pct = 0)
+st1$gene <- rownames(st1)
+write.csv(st1, P("results", "hub_gene_immune_vs_nonimmune.csv"), row.names = FALSE)
+print(st1)
+
+# (2) each immune cell type vs the other immune cells
+Idents(imm) <- "cell_type"
+st2 <- FindAllMarkers(imm, features = hub_top3, test.use = "wilcox",
+                      logfc.threshold = 0, min.pct = 0, return.thresh = 1, only.pos = FALSE)
+write.csv(st2, P("results", "hub_gene_celltype_enrichment_immune.csv"), row.names = FALSE)
+print(st2)
+
+# (3) Tumor vs Normal within each immune cell type
+st3 <- bind_rows(lapply(immune_types, function(ct) {
+  s <- subset(imm, idents = ct)
+  if (ncol(s) == 0 || length(unique(s$group)) < 2 || min(table(s$group)) < 20) return(NULL)
+  Idents(s) <- "group"
+  r <- FindMarkers(s, ident.1 = "Tumor", ident.2 = "Normal", features = hub_top3,
+                   test.use = "wilcox", logfc.threshold = 0, min.pct = 0)
+  r$gene <- rownames(r); r$cell_type <- ct; r
+}))
+write.csv(st3, P("results", "hub_gene_Tumor_vs_Normal_immune.csv"), row.names = FALSE)
+print(st3)
+# Cell-level Wilcoxon p-values are inflated (cells from one patient are not independent);
+# confirm key hits with pseudobulk per sample (AggregateExpression + DESeq2).
+
+ex <- FetchData(imm, vars = c(hub_top3, "cell_type", "group"))
+summ <- ex %>% pivot_longer(all_of(hub_top3), names_to = "gene", values_to = "expr") %>%
+  group_by(gene, cell_type, group) %>%
+  summarise(n_cells = n(), pct_expressing = mean(expr > 0) * 100, mean_expr = mean(expr), .groups = "drop")
+write.csv(summ, P("results", "hub_gene_pct_mean_immune_by_celltype_group.csv"), row.names = FALSE)
+
+avg_expr <- AverageExpression(imm, features = hub_all, group.by = "cell_type",
+                              assays = "RNA", layer = "data")$RNA
+write.csv(round(as.data.frame(avg_expr), 4), P("results", "hub_gene_avg_expression_by_immune_celltype.csv"))
+rm(combined, ex); gc()
+
+# ---- Fig 11: Monocle3 (Monocyte -> Macrophage) -----------------------------------
+sub <- subset(imm, cell_type %in% traj_keep)
+print(table(sub$cell_type, sub$group))
+rm(imm); gc()
+
+cds <- as.cell_data_set(sub)
+rowData(cds)$gene_short_name <- rownames(cds)
+rm(sub); gc()
+cat("Cells in trajectory analysis:", ncol(cds), "\n")
+
+cds <- preprocess_cds(cds, num_dim = 20)
+cds <- reduce_dimension(cds, reduction_method = "UMAP", umap.min_dist = 0.5,
+                        umap.n_neighbors = 30, cores = 1)
+cds <- cluster_cells(cds, resolution = 0.0001)
+cds <- learn_graph(cds, use_partition = FALSE,
+                   learn_graph_control = list(minimal_branch_len = 10,
+                                              geodesic_distance_ratio = 0.5, ncenter = 50))
+
+get_root_node <- function(cds, col, val) {
+  cell_ids <- which(colData(cds)[[col]] == val)
+  cv <- cds@principal_graph_aux[["UMAP"]]$pr_graph_cell_proj_closest_vertex
+  cv <- as.matrix(cv[colnames(cds), , drop = FALSE])
+  igraph::V(principal_graph(cds)[["UMAP"]])$name[
+    as.numeric(names(which.max(table(cv[cell_ids, ]))))]
+}
+cds <- order_cells(cds, root_pr_nodes = get_root_node(cds, "cell_type", traj_root))
+saveRDS(cds, P("rds", "GSE299340_monocle_cds_immune.rds"))
+
+th <- theme_classic() + theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+p11a  <- plot_cells(cds, color_cells_by = "cell_type", label_cell_groups = TRUE,
+                    show_trajectory_graph = FALSE, cell_size = 0.4, group_label_size = 5) +
+  scale_color_manual(values = ct_cols) + labs(title = "Cell type", x = "UMAP 1", y = "UMAP 2") + th
+p11a2 <- plot_cells(cds, color_cells_by = "group", label_cell_groups = FALSE,
+                    show_trajectory_graph = FALSE, cell_size = 0.4) +
+  scale_color_manual(values = grp_cols) + labs(title = "Group", x = "UMAP 1", y = "UMAP 2") + th
+p11b  <- plot_cells(cds, color_cells_by = "pseudotime", label_cell_groups = FALSE,
+                    label_leaves = FALSE, label_branch_points = FALSE, cell_size = 0.4,
+                    trajectory_graph_segment_size = 1.2) +
+  scale_color_viridis(option = "C", name = "pseudotime", na.value = "grey80") +
+  labs(title = "Pseudotime", x = "UMAP 1", y = "UMAP 2") + th
+p11c  <- plot_cells(cds, color_cells_by = "cell_type", label_cell_groups = TRUE,
+                    label_leaves = TRUE, label_branch_points = TRUE, cell_size = 0.3, alpha = 0.5,
+                    trajectory_graph_segment_size = 0.8, group_label_size = 4) +
+  scale_color_manual(values = ct_cols) + labs(x = "UMAP 1", y = "UMAP 2") + th +
+  theme(legend.position = "none")
+ggsave(P("figures", "Fig11A_UMAP_celltype.pdf"), p11a + p11a2, width = 13, height = 6)
+ggsave(P("figures", "Fig11B_Pseudotime.pdf"), p11b, width = 7, height = 6)
+ggsave(P("figures", "Fig11C_Trajectory.pdf"), p11c, width = 8, height = 6)
+
+# ---- Fig 11D: hub genes along pseudotime -------------------------------------------
+use_genes <- intersect(hub_top3, rownames(cds))
+sf   <- size_factors(cds)
+cnt  <- as.matrix(assay(cds[use_genes, ], "counts"))
+lnrm <- log1p(t(t(cnt) / sf))
+pt   <- pseudotime(cds)
+
+gt <- graph_test(cds[use_genes, ], neighbor_graph = "principal_graph", cores = cores)
+write.csv(gt, P("results", "hub_gene_graph_test_immune.csv"))
+
+p_list <- lapply(use_genes, function(g) {
+  d <- data.frame(pseudotime = pt, expr = lnrm[g, names(pt)], cell_type = colData(cds)$cell_type)
+  d <- d[is.finite(d$pseudotime), ]
+  ct <- suppressWarnings(cor.test(d$pseudotime, d$expr, method = "spearman", exact = FALSE))
+  ggplot(d, aes(pseudotime, expr)) +
+    geom_point(aes(colour = cell_type), size = 0.4, alpha = 0.25) +
+    geom_smooth(method = "gam", formula = y ~ s(x, k = 5), colour = "black", fill = "grey80") +
+    scale_colour_manual(values = ct_cols) +
+    labs(title = g, x = "pseudotime", y = "log1p(normalised expression)", colour = "Cell type",
+         subtitle = sprintf("Spearman rho = %.2f (p = %.2g) | Moran's I q = %.2g",
+                            ct$estimate, ct$p.value, gt[g, "q_value"])) +
+    theme_classic()
+})
+ggsave(P("figures", "Fig11D_HubGenes_Pseudotime.pdf"), wrap_plots(p_list, ncol = 1),
+       width = 7, height = 4 * length(p_list))
+
+# ---- Fig 11E: gene modules + hub-gene heatmap ----------------------------------------
+det  <- Matrix::rowSums(assay(cds, "counts") > 0) / ncol(cds)
+cand <- names(sort(det[det >= 0.05], decreasing = TRUE))
+cand <- union(head(cand, 3000), intersect(hub_all, rownames(cds)))
+deg  <- graph_test(cds[cand, ], neighbor_graph = "principal_graph", cores = cores)
+sig  <- rownames(subset(deg, q_value < 0.05 & morans_I > 0.1))
+cat("Trajectory-variable genes:", length(sig), "\n")
+
+if (length(sig) > 50) {
+  mods <- find_gene_modules(cds[sig, ], resolution = 1e-2, cores = cores)
+  agg  <- aggregate_gene_expression(
+    cds, mods,
+    cell_group_df = tibble::tibble(cell = rownames(colData(cds)), group = colData(cds)$cell_type))
+  write.csv(mods[mods$id %in% hub_all, c("id", "module")],
+            P("results", "hub_gene_module_membership.csv"), row.names = FALSE)
+  pdf(P("figures", "Fig11E_GeneModules_Heatmap.pdf"), width = 5, height = 9)
+  pheatmap(as.matrix(agg), scale = "row", clustering_method = "ward.D2",
+           color = colorRampPalette(c("#4575B4", "white", "#D73027"))(100),
+           main = "Gene modules by cell type")
+  dev.off()
 }
 
-p_cm_lasso <- plot_cm(lasso_pred_prob, y_test_num, "Lasso",       "Fig4A_Lasso_CM.pdf")
-p_cm_enet  <- plot_cm(enet_pred_prob,  y_test_num, "Elastic Net", "Fig4B_ElasticNet_CM.pdf")
-p_cm_rf    <- plot_cm(rf_pred_prob,    y_test_num, "Random Forest","Fig4C_RF_CM.pdf")
-
-ggsave("Fig4_All_ConfusionMatrices.pdf",
-       plot = grid.arrange(p_cm_lasso, p_cm_enet, p_cm_rf, ncol=3),
-       width=15, height=5, dpi=300)
-
-###############################Validation ROC Curves on GSE77509################################
-library(GEOquery); library(limma)
-
-# Download independent validation dataset
-gse77509 <- getGEO("GSE77509", GSEMatrix = TRUE, getGPL = FALSE)[[1]]
-
-# Define groups from metadata
-outcome_77509 <- factor(ifelse(
-  grepl("tumor|HCC|hepatocellular", pData(gse77509)$source_name_ch1, ignore.case=TRUE),
-  "Tumor", "Normal"), levels=c("Normal","Tumor"))
-
-# Extract and clean expression matrix
-expr_77509  <- exprs(gse77509)
-feat_77509  <- fData(gse77509)
-gene_col    <- colnames(feat_77509)[grep("symbol", colnames(feat_77509), ignore.case=TRUE)[1]]
-gene_syms   <- feat_77509[[gene_col]]
-valid       <- !is.na(gene_syms) & gene_syms != ""
-
-# Average duplicates, normalize, log2 transform
-expr_df  <- as.data.frame(expr_77509[valid, ])
-expr_df$Gene <- gene_syms[valid]
-expr_agg <- expr_df %>% group_by(Gene) %>% summarise(across(everything(), mean))
-expr_mat <- as.matrix(expr_agg[, -1]); rownames(expr_mat) <- expr_agg$Gene
-expr_norm <- normalizeBetweenArrays(log2(expr_mat + 1), method = "quantile")
-
-# Align to training feature space
-feature_genes  <- colnames(X_train_mat)
-common         <- intersect(rownames(expr_norm), feature_genes)
-val_mat        <- t(expr_norm[common, ])
-missing        <- setdiff(feature_genes, common)
-if (length(missing) > 0)
-  val_mat <- cbind(val_mat, matrix(0, nrow=nrow(val_mat), ncol=length(missing),
-                   dimnames=list(rownames(val_mat), missing)))
-val_mat <- val_mat[, feature_genes, drop=FALSE]
-y_val   <- as.numeric(outcome_77509 == "Tumor")
-
-# Predict and compute ROC
-roc_lasso_val <- roc(y_val, predict(lasso_cv, newx=val_mat, s="lambda.min", type="response")[,1])
-roc_enet_val  <- roc(y_val, predict(enet_cv,  newx=val_mat, s="lambda.min", type="response")[,1])
-roc_rf_val    <- roc(y_val, predict(rf_model, newdata=val_mat, type="prob")[,"Tumor"])
-
-cat("LASSO AUC:", round(auc(roc_lasso_val), 4))
-cat("Elastic Net AUC:", round(auc(roc_enet_val), 4))
-cat("Random Forest AUC:", round(auc(roc_rf_val), 4))
-
-# Plot ROC curves and save
-ggsave("Fig4_Validation_ROC.pdf",
-  plot = grid.arrange(
-    plot_single_roc(roc_lasso_val, "ROC of Lasso",       paste0("AUC=", round(auc(roc_lasso_val),3))),
-    plot_single_roc(roc_enet_val,  "ROC of ElasticNet",  paste0("AUC=", round(auc(roc_enet_val),3))),
-    plot_single_roc(roc_rf_val,    "ROC of RandomForest",paste0("AUC=", round(auc(roc_rf_val),3))),
-    ncol=3), width=12, height=4, dpi=300)
-################################################━━━  PART 5 — scRNA-SEQ ANALYSIS  ######################
-library(Seurat)
-
-# Extract raw data
-untar("GSE299340_RAW.tar", exdir = "GSE299340/raw")
-
-# Define sample metadata
-sample_meta <- data.frame(
-  gsm    = c("GSM9037556","GSM9037557","GSM9037558","GSM9037559","GSM9037560",
-             "GSM9037561","GSM9037562","GSM9037563","GSM9037564","GSM9037565"),
-  sample = as.character(291:300),
-  group  = c("Tumor","Tumor","Tumor","Tumor","Tumor",
-             "Normal","Normal","Normal","Normal","Normal")
-)
-
-# Load each sample into a Seurat object
-raw_dir <- "GSE299340/raw"
-seurat_list <- lapply(seq_len(nrow(sample_meta)), function(i) {
-  sid <- sample_meta$sample[i]
-  grp <- sample_meta$group[i]
-  gsm <- sample_meta$gsm[i]
-  mat <- ReadMtx(
-    mtx      = file.path(raw_dir, paste0(gsm,"_",sid,"_matrix.mtx.gz")),
-    cells    = file.path(raw_dir, paste0(gsm,"_",sid,"_barcodes.tsv.gz")),
-    features = file.path(raw_dir, paste0(gsm,"_",sid,"_features.tsv.gz"))
-  )
-  obj <- CreateSeuratObject(counts=mat, project=sid, min.cells=3, min.features=200)
-  obj$sample <- sid; obj$group <- grp; obj$gsm <- gsm
-  obj
-})
-names(seurat_list) <- sample_meta$sample
-cat("All", length(seurat_list), "samples loaded")
-######################################16 · Calculate MT% and Filter Low-Quality Cells#########################
-# Calculate mitochondrial percentage per cell
-seurat_list <- lapply(seurat_list, function(obj) {
-  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
-  obj
-})
-
-# Merge for QC visualization
-qc_merged <- merge(seurat_list[[1]], y = seurat_list[-1],
-                   add.cell.ids = sample_meta$sample)
-
-# QC violin plot BEFORE filtering
-p_qc_before <- VlnPlot(qc_merged,
-  features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
-  group.by = "sample", ncol = 3, pt.size = 0)
-ggsave("QC_violin_before_filter.pdf", plot=p_qc_before, width=14, height=5, dpi=300)
-
-# Apply QC filters
-seurat_list <- lapply(seurat_list, function(obj) {
-  subset(obj, subset = nFeature_RNA > 200 &
-                       nFeature_RNA < 6000 &
-                       percent.mt < 20)
-})
-
-# Count retained cells
-total_after <- sum(sapply(seurat_list, ncol))
-cat("Total cells after QC:", total_after)  # → 70,608
-###################17 · Merge, Normalize, Select Variable Genes, PCA + Harmony###########################
-library(harmony)
-
-# Normalize each sample
-seurat_list <- lapply(seurat_list, function(obj) {
-  obj <- NormalizeData(obj)
-  obj <- FindVariableFeatures(obj, nfeatures = 2000)
-  obj
-})
-
-# Merge all 10 samples
-combined <- merge(seurat_list[[1]], y = seurat_list[-1],
-                  add.cell.ids = sample_meta$sample)
-
-# Scale and PCA
-combined <- ScaleData(combined)
-combined <- RunPCA(combined, npcs = 30)
-
-# Harmony batch correction (removes per-sample variation)
-combined <- RunHarmony(combined, group.by.vars = "sample", max.iter.harmony = 20)
-
-# Save checkpoint
-saveRDS(combined, "GSE299340_merged_harmony.rds")
-cat("Harmony done! Reductions:", names(combined@reductions))
-
-####################18 · FindNeighbors, FindClusters, tSNE####################
-# Graph-based clustering using Harmony reduction
-combined <- FindNeighbors(combined, dims = 1:20, reduction = "harmony")
-combined <- FindClusters(combined, resolution = 0.3)
-cat("Clusters:", length(unique(combined$seurat_clusters)))  # → 15
-
-# tSNE visualization
-combined <- RunTSNE(combined, dims = 1:20, reduction = "harmony",
-                    check_duplicates = FALSE)
-
-# Fig6C: tSNE colored by cluster
-p_clusters <- DimPlot(combined, reduction="tsne", group.by="seurat_clusters",
-                      label=TRUE, repel=TRUE, pt.size=0.3, label.size=4) +
-  labs(x="tSNE_1", y="tSNE_2") + theme_classic()
-ggsave("Fig6C_tSNE_Clusters.pdf", plot=p_clusters, width=8, height=7, dpi=300)
-
-# Fig6A: tSNE colored by sample
-p_sample <- DimPlot(combined, reduction="tsne", group.by="sample", pt.size=0.3)
-ggsave("Fig6A_tSNE_Sample.pdf", plot=p_sample, width=8, height=7, dpi=300)
-
-# Save
-saveRDS(combined, "GSE299340_clustered.rds")
-#####################19A · FindAllMarkers — Wilcoxon Rank-Sum Test##################################
-# Downsample and join layers for RAM efficiency
-combined_small <- subset(combined, downsample = 200)
-DefaultAssay(combined_small) <- "RNA"
-combined_small[["RNA"]] <- JoinLayers(combined_small[["RNA"]])
-
-# Find marker genes per cluster
-markers <- FindAllMarkers(
-  combined_small,
-  only.pos        = TRUE,
-  min.pct         = 0.25,
-  logfc.threshold = 0.25,
-  test.use        = "wilcox"
-)
-cat("Markers found:", nrow(markers))  # → 26,236
-write.csv(markers, "GSE299340_markers.csv", row.names = FALSE)
-
-# Fig6B: Top 3 marker genes per cluster heatmap
-top3 <- markers %>% group_by(cluster) %>% slice_max(avg_log2FC, n=3) %>% ungroup()
-combined_down <- subset(combined, downsample = 50)
-combined_down <- ScaleData(combined_down, features = unique(top3$gene))
-
-p_heat <- DoHeatmap(combined_down, features=unique(top3$gene),
-  group.by="seurat_clusters", raster=TRUE, size=5) +
-  scale_fill_gradientn(colors=c("#3B0F70","black","#FDE725"), limits=c(-2.5,2.5))
-ggsave("Fig6B_Heatmap.pdf", plot=p_heat, width=12, height=8, dpi=300)
-rm(combined_down, combined_small); gc()
-#####################19B · SingleR Automated Cell Type Annotation#######################
-library(SingleR); library(celldex)
-
-# Run SingleR on 5000-cell subset (RAM efficient)
-combined_sub <- subset(combined, downsample = 500)
-combined_sub <- JoinLayers(combined_sub)
-expr_sub     <- GetAssayData(combined_sub, assay="RNA", layer="data")
-
-ref      <- HumanPrimaryCellAtlasData()
-anno_sub <- SingleR(test=expr_sub, ref=ref, labels=ref$label.main)
-cat("Annotation done!\n")
-print(table(anno_sub$labels))
-
-# Transfer to full object by cluster majority vote
-combined_sub$cell_type <- anno_sub$labels
-cluster_anno <- data.frame(
-  cluster   = combined_sub$seurat_clusters,
-  cell_type = combined_sub$cell_type) %>%
-  group_by(cluster) %>%
-  summarise(cell_type = names(which.max(table(cell_type))), .groups="drop")
-
-# Assign to full object using case_when
-cluster_vec <- as.character(combined$seurat_clusters)
-combined@meta.data$cell_type <- dplyr::case_when(
-  cluster_vec == "0"  ~ "T_cells",
-  cluster_vec == "1"  ~ "T_cells",
-  cluster_vec == "2"  ~ "Macrophage",
-  cluster_vec == "3"  ~ "Hepatocytes",
-  cluster_vec == "4"  ~ "Monocyte",
-  cluster_vec == "5"  ~ "NK_cell",
-  cluster_vec == "6"  ~ "Neutrophils",
-  cluster_vec == "7"  ~ "Endothelial_cells",
-  cluster_vec == "8"  ~ "B_cell",
-  cluster_vec == "9"  ~ "Hepatocytes",
-  cluster_vec == "10" ~ "B_cell",
-  cluster_vec == "11" ~ "Macrophage",
-  cluster_vec == "12" ~ "T_cells",
-  cluster_vec == "13" ~ "Tissue_stem_cells",
-  cluster_vec == "14" ~ "B_cell"
-)
-
-# Fig6D: tSNE by cell type
-p_celltype <- DimPlot(combined, reduction="tsne", group.by="cell_type",
-                      label=TRUE, repel=TRUE, pt.size=0.3)
-ggsave("Fig6D_tSNE_CellType.pdf", plot=p_celltype, width=8, height=7, dpi=300)
-
-# Save annotated object
-saveRDS(combined, "GSE299340_merged_annotated.rds")
-rm(combined_sub, expr_sub); gc()
-
-########################20 · Compare Cell Type Proportions: Tumor vs Normal#############################
-library(ggplot2); library(dplyr)
-
-# Calculate proportions per group
-prop_df <- combined@meta.data %>%
-  group_by(group, cell_type) %>%
-  summarise(n = n(), .groups = "drop") %>%
-  group_by(group) %>%
-  mutate(prop = n / sum(n))
-
-# Fig6E: Grouped bar chart
-p6e <- ggplot(prop_df, aes(x=cell_type, y=prop, fill=group)) +
-  geom_bar(stat="identity", position="dodge", width=0.7) +
-  scale_fill_manual(values=c("Tumor"="#E74C3C", "Normal"="#3498DB")) +
-  scale_y_continuous(limits=c(0,1), breaks=seq(0,1,0.25)) +
-  labs(title="Cell Type Distribution: Tumor vs Normal",
-       x=NULL, y="Proportion") +
-  theme_bw() +
-  theme(axis.text.x = element_text(angle=45, hjust=1, size=9),
-        panel.grid  = element_blank())
-
-ggsave("Fig6E_CellProportions.pdf", plot=p6e, width=10, height=6, dpi=300)
-
-######################21 · Differential Expression Across All Clusters####################################
-# Load all DEGs (run FindAllMarkers on full annotated object)
-all_markers_deg <- read.csv("GSE299340_markers.csv")
-
-# Categorize genes
-df <- all_markers_deg %>%
-  mutate(
-    category = case_when(
-      avg_log2FC > 0.25 & p_val_adj < 0.05 ~ "UP",
-      avg_log2FC < -0.25 & p_val_adj < 0.05 ~ "DOWN",
-      TRUE ~ "NonDEG"
-    ),
-    cluster = as.factor(cluster),
-    x_center = as.numeric(cluster),
-    x = x_center + runif(n(), -0.35, 0.35)   # scatter within cluster
-  )
-
-# Labels: top 4 up + top 4 down per cluster
-labels_df <- df %>% group_by(cluster) %>%
-  slice_max(avg_log2FC, n=4) %>%
-  bind_rows(df %>% group_by(cluster) %>% slice_min(avg_log2FC, n=4)) %>%
-  ungroup()
-
-# Fig7A: Scatter plot
-p7a <- ggplot(df, aes(x=x, y=avg_log2FC)) +
-  geom_point(aes(color=category), size=0.6, alpha=0.9) +
-  geom_text_repel(data=labels_df, aes(label=gene, color=category), size=3) +
-  scale_color_manual(values=c("UP"="#E64B35","DOWN"="#4DBBD5","NonDEG"="grey70")) +
-  scale_x_continuous(breaks=unique(as.numeric(df$cluster)),
-                     labels=levels(df$cluster)) +
-  labs(x="Clusters", y="log2(Fold Change)") +
-  theme_classic()
-
-ggsave("Fig7A_DEG_scatter.pdf", p7a, width=14, height=5)
-
-# Count significant DEGs
-sig_up   <- subset(all_markers_deg, p_val_adj < 0.05 & avg_log2FC > 0.25)
-sig_down <- subset(all_markers_deg, p_val_adj < 0.05 & avg_log2FC < -0.25)
-cat("Upregulated:", nrow(sig_up), "| Downregulated:", nrow(sig_down))
-#########################22 · Intersect Strict scRNA DEGs with Bulk ML Genes###############################
-# Strict scRNA DEGs
-scrna_degs <- unique(subset(all_markers_deg,
-  p_val_adj < 0.05 & abs(avg_log2FC) > 1)$gene)
-cat("Strict scRNA DEGs:", length(scrna_degs))
-
-# ML genes found in ≥2 methods
-gene_counts <- read.csv("HCC_ML_gene_overlap.csv")
-strict_ml_genes <- gene_counts$Gene[gene_counts$Count >= 2]
-cat("Strict ML genes:", length(strict_ml_genes))  # → 101
-
-# Intersect
-hub_genes <- intersect(strict_ml_genes, scrna_degs)
-cat("\n>>> Hub genes confirmed:", length(hub_genes))
-print(hub_genes)
-
-# Save hub genes
-write.csv(data.frame(HubGene = hub_genes),
-          "HCC_hub_genes_strict.csv", row.names = FALSE)
-
-# Save all ML results
-save(lasso_cv, enet_cv, rf_model, lasso_genes, enet_genes, rf_genes,
-     hub_genes, file = "HCC_all_ML_results.RData")
-
+hub_in <- intersect(hub_all, rownames(cds))
+m   <- log1p(t(t(as.matrix(assay(cds[hub_in, ], "counts"))) / sf))
+avg <- sapply(unique(colData(cds)$cell_type),
+              function(ct) rowMeans(m[, colData(cds)$cell_type == ct, drop = FALSE]))
+avg <- avg[apply(avg, 1, sd) > 0, , drop = FALSE]
+pdf(P("figures", "Fig11E2_HubGene_Heatmap.pdf"), width = 6, height = 6)
+pheatmap(avg, scale = "row", color = colorRampPalette(c("#4575B4", "white", "#D73027"))(100),
+         main = "Hub-gene expression by cell type")
+dev.off()
+cat("Done.\n")
