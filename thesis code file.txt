@@ -411,22 +411,31 @@ enrich_network(go_cc, "GO Cellular Component Enrichment Network", P("figures", "
 enrich_network(go_mf, "GO Molecular Function Enrichment Network", P("figures", "Fig2C_GO_MF_network.pdf"))
 
 # ---- Reactome GSEA (Fig 2D): genes ranked by |GS for ImmuneScore| --------------------
-ranked <- abs(coexp$GS_Immune[match(gene_ids$SYMBOL, coexp$Gene)])
-names(ranked) <- gene_ids$ENTREZID
-ranked <- sort(ranked[!is.na(ranked) & !duplicated(names(ranked))], decreasing = TRUE)
-
 set.seed(SEED)
-gsea_reactome <- gsePathway(geneList = ranked, organism = "human", minGSSize = 5, maxGSSize = 500,
-                            pvalueCutoff = 0.05, verbose = FALSE)
+gsea_reactome <- gsePathway(geneList = ranked, organism = "human",
+                            minGSSize = 15, maxGSSize = 500,
+                            pvalueCutoff = 0.05, pAdjustMethod = "BH",
+                            verbose = FALSE)
 cat("Reactome pathways found:", nrow(gsea_reactome), "\n")
 write.csv(as.data.frame(gsea_reactome), P("results", "Reactome_GSEA.csv"), row.names = FALSE)
 
-if (nrow(gsea_reactome@result) >= 1) {
-  top_ids <- gsea_reactome@result %>% dplyr::arrange(p.adjust) %>% dplyr::slice_head(n = 3) %>% dplyr::pull(ID)
+# top pathways in each direction
+res <- as.data.frame(gsea_reactome)
+pos <- res[res$NES > 0, ]; pos <- pos[order(pos$p.adjust), ]
+neg <- res[res$NES < 0, ]; neg <- neg[order(neg$p.adjust), ]
+cat("\nTop positive (rise with immune score):\n"); print(head(pos[, c("Description", "NES", "p.adjust")], 10))
+cat("\nTop negative (fall with immune score):\n"); print(head(neg[, c("Description", "NES", "p.adjust")], 10))
+
+# figures
+if (nrow(pos) >= 1) {
+  top_ids <- head(pos$ID, 3)
   p_re <- gseaplot2(gsea_reactome, geneSetID = top_ids, title = "",
                     color = c("red", "green", "blue")[seq_along(top_ids)], base_size = 11,
                     rel_heights = c(1.5, 0.5, 1), pvalue_table = FALSE)
   ggsave(P("figures", "Fig2D_Reactome_GSEA.pdf"), plot = p_re, width = 10, height = 7, dpi = 300)
+
+  p_dot <- dotplot(gsea_reactome, showCategory = 10, split = ".sign") + facet_grid(. ~ .sign)
+  ggsave(P("figures", "Fig2D2_Reactome_GSEA_dotplot.pdf"), p_dot, width = 11, height = 7, dpi = 300)
 }
 cat("Done.\n")
 # =============================================================================
